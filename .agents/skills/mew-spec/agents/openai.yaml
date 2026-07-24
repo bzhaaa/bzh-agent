@@ -1,0 +1,4 @@
+interface:
+  display_name: "Mew Spec"
+  short_description: "通过四阶段文档审批流程驱动项目功能开发、验证与最终验收"
+  default_prompt: "Use $mew-spec to clarify this feature and drive it through spec, plan, tasks, checklist, implementation, and acceptance."
