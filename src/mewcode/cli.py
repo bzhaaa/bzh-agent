@@ -10,10 +10,12 @@ from pathlib import Path
 
 from rich.console import Console
 
+from mewcode.agent.runner import AgentRunner
+from mewcode.agent.scheduler import ToolScheduler
 from mewcode.config import ProviderProfile, load_config
 from mewcode.errors import ConfigError
 from mewcode.providers import create_provider
-from mewcode.session import ChatSession
+from mewcode.session import READ_ONLY_TOOLS, ChatSession
 from mewcode.tools import CommandApprovalRequest, ToolContext, ToolExecutor, create_default_registry
 from mewcode.tui import MewCodeApp, render_static_transcript
 
@@ -34,6 +36,7 @@ async def run_app(profile: ProviderProfile, console: Console | None = None) -> N
         project_root = Path.cwd().resolve()
         registry = create_default_registry()
         executor = ToolExecutor(registry)
+        readonly_registry = registry.subset(READ_ONLY_TOOLS)
         approval_target: list[object] = []
 
         async def request_approval(request: CommandApprovalRequest) -> bool:
@@ -45,7 +48,13 @@ async def run_app(profile: ProviderProfile, console: Console | None = None) -> N
             return bool(await handler(request))
 
         context = ToolContext(project_root, request_approval)
-        session = ChatSession(provider, registry, executor, context)
+        runner = AgentRunner(
+            provider,
+            ToolScheduler(registry, executor),
+            ToolScheduler(readonly_registry, ToolExecutor(readonly_registry)),
+            context,
+        )
+        session = ChatSession(runner)
         app = MewCodeApp(session, profile_name=profile.name, model=profile.model)
         approval_target.append(app)
         snapshot = await app.run_async(mouse=True)

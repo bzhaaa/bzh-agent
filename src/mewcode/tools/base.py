@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 
@@ -14,6 +15,11 @@ from mewcode.tools.errors import ToolErrorCode
 
 MODEL_RESULT_LIMIT = 64_000
 SUMMARY_LIMIT = 500
+
+
+class ToolExecutionPolicy(StrEnum):
+    PARALLEL_READ = "parallel_read"
+    SERIAL_SIDE_EFFECT = "serial_side_effect"
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,5 +104,6 @@ class Tool(Protocol):
     definition: ToolDefinition
     argument_model: type[BaseModel]
     requires_approval: bool
+    policy: ToolExecutionPolicy
 
     async def execute(self, arguments: BaseModel, context: ToolContext) -> dict[str, object]: ...

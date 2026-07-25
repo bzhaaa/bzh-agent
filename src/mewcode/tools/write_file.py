@@ -2,7 +2,7 @@
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from mewcode.tools.base import ToolContext, ToolDefinition
+from mewcode.tools.base import ToolContext, ToolDefinition, ToolExecutionPolicy
 from mewcode.tools.errors import ToolError, ToolErrorCode
 from mewcode.tools.paths import ProjectPaths, atomic_write_text
 
@@ -19,6 +19,7 @@ class WriteFileArguments(BaseModel):
 class WriteFileTool:
     argument_model = WriteFileArguments
     requires_approval = False
+    policy = ToolExecutionPolicy.SERIAL_SIDE_EFFECT
     definition = ToolDefinition(
         "write_file",
         "在项目内新建 UTF-8 文本文件或完整覆盖已有文件。",

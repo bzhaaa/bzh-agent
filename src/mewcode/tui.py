@@ -17,8 +17,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Markdown, Static, TextArea
 from textual.worker import Worker
 
-from mewcode.errors import ProviderError
-from mewcode.models import StreamEventKind
+from mewcode.agent import AgentEventKind, AgentMode, AgentStopReason
 from mewcode.session import ChatSession
 from mewcode.tools import CommandApprovalRequest, ToolCall, ToolErrorCode
 
@@ -374,6 +373,9 @@ class MewCodeApp(App[TranscriptSnapshot]):
         self.current_message: AssistantMessage | None = None
         self.tool_messages: dict[str, ToolMessage] = {}
         self.approval_screen: CommandApprovalScreen | None = None
+        self.mode = AgentMode.NORMAL
+        self.iteration = 0
+        self.usage_text = "Token ?"
 
     def compose(self) -> ComposeResult:
         yield Static(f"MewCode  {self.profile_name} · {self.model}", id="app-title")
@@ -406,45 +408,60 @@ class MewCodeApp(App[TranscriptSnapshot]):
         composer.load_text("")
         composer.update_height()
         user_entry = TranscriptEntry("user", content=user_input)
-        assistant_entry = TranscriptEntry("assistant", state="streaming")
-        self.transcript.extend((user_entry, assistant_entry))
+        self.transcript.append(user_entry)
 
         conversation = self.query_one(ConversationView)
         await conversation.append_message(UserMessage(user_entry))
-        assistant_message = AssistantMessage(assistant_entry)
-        await conversation.append_message(assistant_message)
 
         self.is_generating = True
-        self.current_entry = assistant_entry
-        self.current_message = assistant_message
-        self.query_one("#composer-status", Static).update("正在生成")
+        self.current_entry = None
+        self.current_message = None
+        self.tool_messages = {}
+        self.query_one("#composer-status", Static).update(self._status_text("正在生成"))
         self.reply_worker = self.run_worker(
-            self._consume_reply(user_input, assistant_entry, assistant_message),
+            self._consume_reply(user_input),
             name="reply",
             group="reply",
             exclusive=True,
             exit_on_error=False,
         )
 
-    async def _consume_reply(
-        self,
-        user_input: str,
-        entry: TranscriptEntry,
-        message: AssistantMessage,
-    ) -> None:
+    async def _consume_reply(self, user_input: str) -> None:
         conversation = self.query_one(ConversationView)
-        tool_result_seen = False
-        final_text_started = False
+        iteration_messages: dict[int, tuple[TranscriptEntry, AssistantMessage]] = {}
+
+        async def ensure_message(iteration: int) -> tuple[TranscriptEntry, AssistantMessage]:
+            existing = iteration_messages.get(iteration)
+            if existing is not None:
+                return existing
+            entry = TranscriptEntry("assistant", state="streaming")
+            message = AssistantMessage(entry)
+            self.transcript.append(entry)
+            await conversation.append_message(message)
+            iteration_messages[iteration] = (entry, message)
+            self.current_entry = entry
+            self.current_message = message
+            return entry, message
+
         try:
             async for event in self.session.stream_reply(user_input):
-                if event.kind == StreamEventKind.THINKING_DELTA:
+                if event.kind == AgentEventKind.MODE_CHANGED:
+                    self.mode = event.mode
+                    self.query_one("#composer-status", Static).update(
+                        self._status_text("模式已切换")
+                    )
+                elif event.kind == AgentEventKind.ITERATION_STARTED:
+                    self.iteration = event.iteration
+                    self.query_one("#composer-status", Static).update(self._status_text("请求模型"))
+                elif event.kind == AgentEventKind.THINKING_DELTA:
+                    entry, message = await ensure_message(event.iteration)
                     entry.thinking += event.delta
-                elif event.kind == StreamEventKind.TEXT_DELTA:
-                    if tool_result_seen and not final_text_started and entry.content:
-                        entry.content += "\n\n"
-                    final_text_started = final_text_started or tool_result_seen
+                    await conversation.refresh_message(message)
+                elif event.kind == AgentEventKind.TEXT_DELTA:
+                    entry, message = await ensure_message(event.iteration)
                     entry.content += event.delta
-                elif event.kind == StreamEventKind.TOOL_CALL and event.tool_call is not None:
+                    await conversation.refresh_message(message)
+                elif event.kind == AgentEventKind.TOOL_CALL and event.tool_call is not None:
                     tool_entry = TranscriptEntry(
                         "tool",
                         content=self._tool_call_summary(event.tool_call),
@@ -452,13 +469,11 @@ class MewCodeApp(App[TranscriptSnapshot]):
                         tool_name=event.tool_call.name,
                         call_id=event.tool_call.id,
                     )
-                    assistant_index = self.transcript.index(entry)
-                    self.transcript.insert(assistant_index, tool_entry)
+                    self.transcript.append(tool_entry)
                     tool_message = ToolMessage(tool_entry)
                     self.tool_messages[event.tool_call.id] = tool_message
-                    await conversation.insert_message_before(tool_message, message)
-                elif event.kind == StreamEventKind.TOOL_RESULT and event.tool_result is not None:
-                    tool_result_seen = True
+                    await conversation.append_message(tool_message)
+                elif event.kind == AgentEventKind.TOOL_RESULT and event.tool_result is not None:
                     tool_message = self.tool_messages.get(event.tool_result.call_id)
                     if tool_message is not None:
                         result = event.tool_result
@@ -467,46 +482,102 @@ class MewCodeApp(App[TranscriptSnapshot]):
                             tool_message.entry.state = "complete"
                         elif result.error_code == ToolErrorCode.USER_REJECTED:
                             tool_message.entry.state = "rejected"
+                        elif result.error_code == ToolErrorCode.CANCELLED:
+                            tool_message.entry.state = "cancelled"
                         else:
                             tool_message.entry.state = "error"
                         tool_message.refresh_entry()
-                elif event.kind == StreamEventKind.LIMIT_REACHED:
-                    entry.state = "error"
-                    if not entry.content:
-                        entry.content = "本回合未生成最终答复。"
-                    for tool_message in self.tool_messages.values():
-                        if tool_message.entry.state in {"pending", "approved"}:
-                            tool_message.entry.state = "error"
-                            tool_message.entry.content = f"未执行：{event.delta}"
-                            tool_message.refresh_entry()
-                    status_entry = TranscriptEntry("status", event.delta, state="error")
-                    self.transcript.append(status_entry)
-                    await conversation.append_message(StatusMessage(status_entry))
-                elif event.kind == StreamEventKind.DONE:
-                    entry.state = "complete"
-                await conversation.refresh_message(message)
+                elif event.kind == AgentEventKind.TOKEN_USAGE and event.usage is not None:
+                    total = event.usage.cumulative.total_tokens
+                    self.usage_text = f"Token {total}" if total is not None else "Token ?"
+                    self.query_one("#composer-status", Static).update(self._status_text("正在生成"))
+                elif event.kind == AgentEventKind.PROGRESS and event.progress is not None:
+                    progress = event.progress
+                    if progress.phase == "executing_tools":
+                        detail = f"工具 {progress.completed_tools}/{progress.total_tools}"
+                    elif progress.phase == "checkpoint_committed":
+                        detail = "已保存检查点"
+                        current = iteration_messages.get(progress.iteration)
+                        if current is not None:
+                            current[0].state = "complete"
+                            await conversation.refresh_message(current[1])
+                    else:
+                        detail = "请求模型"
+                    self.query_one("#composer-status", Static).update(self._status_text(detail))
+                elif event.kind == AgentEventKind.STOPPED:
+                    await self._apply_stop(event.stop_reason, event.delta, iteration_messages)
         except asyncio.CancelledError:
-            entry.state = "cancelled"
-            entry.thinking = ""
-            entry.content = "已取消当前回复。"
-            for tool_message in self.tool_messages.values():
-                if tool_message.entry.state in {"pending", "approved"}:
-                    tool_message.entry.state = "cancelled"
-                    tool_message.entry.content = "已取消。"
-                    tool_message.refresh_entry()
-            await conversation.refresh_message(message)
-        except ProviderError as error:
+            self.session.cancel_current()
+            raise
+        except Exception:
+            entry, message = await ensure_message(self.iteration)
             entry.state = "error"
             entry.thinking = ""
-            entry.content = f"请求失败：{error}"
+            entry.content = "Agent 运行发生内部错误。"
             await conversation.refresh_message(message)
         finally:
             self.is_generating = False
             self.current_entry = None
             self.current_message = None
             self.reply_worker = None
-            self.query_one("#composer-status", Static).update("就绪")
+            self.query_one("#composer-status", Static).update(self._status_text("就绪"))
             self.query_one(ComposerTextArea).focus()
+
+    def _status_text(self, detail: str) -> str:
+        mode = "Plan" if self.mode == AgentMode.PLAN else "Normal"
+        iteration = f" · {self.iteration}/10" if self.iteration else ""
+        return f"{mode}{iteration} · {self.usage_text} · {detail}"
+
+    async def _apply_stop(
+        self,
+        reason: AgentStopReason | None,
+        detail: str,
+        messages: dict[int, tuple[TranscriptEntry, AssistantMessage]],
+    ) -> None:
+        conversation = self.query_one(ConversationView)
+        if reason == AgentStopReason.COMPLETED:
+            for entry, message in messages.values():
+                entry.state = "complete"
+                await conversation.refresh_message(message)
+            return
+
+        labels = {
+            AgentStopReason.ITERATION_LIMIT: "已达到 10 次迭代上限。",
+            AgentStopReason.UNKNOWN_TOOL_LIMIT: "连续请求未知工具，Agent 已停止。",
+            AgentStopReason.CANCELLED: "已取消当前回复。",
+            AgentStopReason.PROVIDER_ERROR: f"请求失败：{detail or '模型服务请求失败。'}",
+            AgentStopReason.INVALID_STREAM: detail or "模型返回了无效的流式响应。",
+            AgentStopReason.NO_PLAN: detail or "当前没有已完成的计划可执行。",
+            AgentStopReason.INVALID_COMMAND: detail or "命令格式无效。",
+        }
+        text = labels.get(reason, detail or "Agent 已停止。")
+        state: TranscriptState = "cancelled" if reason == AgentStopReason.CANCELLED else "error"
+        for entry, message in messages.values():
+            if entry.state == "streaming":
+                entry.state = state
+                if reason == AgentStopReason.CANCELLED:
+                    entry.content = text
+                elif not entry.content:
+                    entry.content = text
+                if state == "cancelled":
+                    entry.thinking = ""
+                await conversation.refresh_message(message)
+        for tool_message in self.tool_messages.values():
+            if tool_message.entry.state in {"pending", "approved"}:
+                tool_message.entry.state = state
+                tool_message.entry.content = text
+                tool_message.refresh_entry()
+        if not messages or reason in {
+            AgentStopReason.ITERATION_LIMIT,
+            AgentStopReason.UNKNOWN_TOOL_LIMIT,
+            AgentStopReason.PROVIDER_ERROR,
+            AgentStopReason.INVALID_STREAM,
+            AgentStopReason.NO_PLAN,
+            AgentStopReason.INVALID_COMMAND,
+        }:
+            status_entry = TranscriptEntry("status", text, state=state)
+            self.transcript.append(status_entry)
+            await conversation.append_message(StatusMessage(status_entry))
 
     @staticmethod
     def _tool_call_summary(call: ToolCall) -> str:
@@ -525,7 +596,7 @@ class MewCodeApp(App[TranscriptSnapshot]):
 
         screen = CommandApprovalScreen(request)
         self.approval_screen = screen
-        self.query_one("#composer-status", Static).update("等待命令确认")
+        self.query_one("#composer-status", Static).update(self._status_text("等待命令确认"))
         try:
             approved = await self.push_screen_wait(screen)
             for tool_message in reversed(tuple(self.tool_messages.values())):
@@ -540,14 +611,14 @@ class MewCodeApp(App[TranscriptSnapshot]):
             return approved
         finally:
             self.approval_screen = None
-            self.query_one("#composer-status", Static).update("正在生成")
+            self.query_one("#composer-status", Static).update(self._status_text("正在生成"))
             self.query_one(ComposerTextArea).focus()
 
     def action_cancel_or_clear(self) -> None:
         if self.is_generating and self.reply_worker is not None:
             if self.approval_screen is not None and self.approval_screen.is_mounted:
                 self.approval_screen.dismiss(False)
-            self.reply_worker.cancel()
+            self.session.cancel_current()
             return
         composer = self.query_one(ComposerTextArea)
         composer.load_text("")

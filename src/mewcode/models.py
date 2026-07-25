@@ -61,22 +61,50 @@ class ToolResultMessage(ChatMessage):
         return "tool"
 
 
-class StreamEventKind(StrEnum):
-    """TUI 可以消费的流事件。"""
+@dataclass(frozen=True, slots=True)
+class TokenUsage:
+    """一次模型请求的归一化 Token 用量。"""
+
+    input_tokens: int | None
+    output_tokens: int | None
+
+    @property
+    def total_tokens(self) -> int | None:
+        if self.input_tokens is None or self.output_tokens is None:
+            return None
+        return self.input_tokens + self.output_tokens
+
+    def accumulate(self, other: TokenUsage) -> TokenUsage:
+        """累计用量，任一未知值会向后传播。"""
+
+        input_tokens = (
+            None
+            if self.input_tokens is None or other.input_tokens is None
+            else self.input_tokens + other.input_tokens
+        )
+        output_tokens = (
+            None
+            if self.output_tokens is None or other.output_tokens is None
+            else self.output_tokens + other.output_tokens
+        )
+        return TokenUsage(input_tokens, output_tokens)
+
+
+class ProviderEventKind(StrEnum):
+    """Provider 与流收集器之间的统一事件。"""
 
     THINKING_DELTA = "thinking_delta"
     TEXT_DELTA = "text_delta"
     TOOL_CALL = "tool_call"
-    TOOL_RESULT = "tool_result"
-    LIMIT_REACHED = "limit_reached"
+    TOKEN_USAGE = "token_usage"
     DONE = "done"
 
 
 @dataclass(frozen=True, slots=True)
-class StreamEvent:
-    """供应商统一流事件。"""
+class ProviderEvent:
+    """供应商无关的底层流事件。"""
 
-    kind: StreamEventKind
+    kind: ProviderEventKind
     delta: str = ""
     tool_call: ToolCall | None = None
-    tool_result: ToolResult | None = None
+    usage: TokenUsage | None = None

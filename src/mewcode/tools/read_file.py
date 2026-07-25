@@ -2,7 +2,7 @@
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from mewcode.tools.base import ToolContext, ToolDefinition
+from mewcode.tools.base import ToolContext, ToolDefinition, ToolExecutionPolicy
 from mewcode.tools.errors import ToolError, ToolErrorCode
 from mewcode.tools.paths import ProjectPaths
 
@@ -20,6 +20,7 @@ class ReadFileArguments(BaseModel):
 class ReadFileTool:
     argument_model = ReadFileArguments
     requires_approval = False
+    policy = ToolExecutionPolicy.PARALLEL_READ
     definition = ToolDefinition(
         "read_file",
         "读取项目内 UTF-8 文本文件的指定行。",

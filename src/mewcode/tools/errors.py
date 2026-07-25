@@ -15,8 +15,6 @@ class ToolErrorCode(StrEnum):
     INVALID_PATTERN = "invalid_pattern"
     PERMISSION_DENIED = "permission_denied"
     USER_REJECTED = "user_rejected"
-    MULTIPLE_TOOLS = "multiple_tools"
-    TOOL_LIMIT_REACHED = "tool_limit_reached"
     TIMEOUT = "timeout"
     EXECUTION_FAILED = "execution_failed"
     CANCELLED = "cancelled"

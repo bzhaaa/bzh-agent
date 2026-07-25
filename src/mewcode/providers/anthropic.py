@@ -13,8 +13,9 @@ from mewcode.errors import ProviderError, ProviderErrorKind
 from mewcode.models import (
     AssistantMessage,
     ChatMessage,
-    StreamEvent,
-    StreamEventKind,
+    ProviderEvent,
+    ProviderEventKind,
+    TokenUsage,
     ToolResultMessage,
     UserMessage,
 )
@@ -123,18 +124,41 @@ class AnthropicProvider:
         self,
         messages: Sequence[ChatMessage],
         tools: Sequence[ToolDefinition] = (),
-    ) -> AsyncIterator[StreamEvent]:
+    ) -> AsyncIterator[ProviderEvent]:
         """发起请求并逐个产生统一事件。"""
 
         saw_text = False
         saw_stop = False
         stop_reason: str | None = None
         calls: dict[int, dict[str, object]] = {}
+        input_tokens: int | None = None
+        output_tokens: int | None = None
+        saw_usage = False
         try:
             manager = self.client.messages.stream(**self._request_arguments(messages, tools))
             async with manager as stream:
                 async for event in stream:
                     event_type = getattr(event, "type", None)
+                    if event_type == "message_start":
+                        if saw_usage:
+                            raise ProviderError(ProviderErrorKind.INVALID_STREAM)
+                        raw_usage = getattr(getattr(event, "message", None), "usage", None)
+                        if raw_usage is not None:
+                            regular = getattr(raw_usage, "input_tokens", None)
+                            cache_creation = getattr(raw_usage, "cache_creation_input_tokens", 0)
+                            cache_read = getattr(raw_usage, "cache_read_input_tokens", 0)
+                            if not all(
+                                value is None or isinstance(value, int) and value >= 0
+                                for value in (regular, cache_creation, cache_read)
+                            ):
+                                raise ProviderError(ProviderErrorKind.INVALID_STREAM)
+                            input_tokens = (
+                                None
+                                if regular is None
+                                else regular + (cache_creation or 0) + (cache_read or 0)
+                            )
+                            saw_usage = True
+                        continue
                     if event_type == "message_stop":
                         saw_stop = True
                         continue
@@ -144,6 +168,15 @@ class AnthropicProvider:
                             if stop_reason is not None and stop_reason != reason:
                                 raise ProviderError(ProviderErrorKind.INVALID_STREAM)
                             stop_reason = reason
+                        raw_usage = getattr(event, "usage", None)
+                        if raw_usage is not None:
+                            value = getattr(raw_usage, "output_tokens", None)
+                            if value is not None and (not isinstance(value, int) or value < 0):
+                                raise ProviderError(ProviderErrorKind.INVALID_STREAM)
+                            if output_tokens is not None and value is not None:
+                                raise ProviderError(ProviderErrorKind.INVALID_STREAM)
+                            output_tokens = value
+                            saw_usage = True
                         continue
                     if event_type == "content_block_start":
                         index = getattr(event, "index", None)
@@ -185,13 +218,13 @@ class AnthropicProvider:
                             raise ProviderError(ProviderErrorKind.INVALID_STREAM)
                         if text:
                             saw_text = True
-                            yield StreamEvent(StreamEventKind.TEXT_DELTA, text)
+                            yield ProviderEvent(ProviderEventKind.TEXT_DELTA, text)
                     elif delta_type == "thinking_delta":
                         thinking = getattr(delta, "thinking", None)
                         if not isinstance(thinking, str):
                             raise ProviderError(ProviderErrorKind.INVALID_STREAM)
                         if thinking:
-                            yield StreamEvent(StreamEventKind.THINKING_DELTA, thinking)
+                            yield ProviderEvent(ProviderEventKind.THINKING_DELTA, thinking)
                     elif delta_type == "input_json_delta":
                         index = getattr(event, "index", None)
                         partial_json = getattr(delta, "partial_json", None)
@@ -231,10 +264,15 @@ class AnthropicProvider:
                     raise ProviderError(ProviderErrorKind.INVALID_STREAM) from error
                 if not isinstance(arguments, dict):
                     raise ProviderError(ProviderErrorKind.INVALID_STREAM)
-                yield StreamEvent(
-                    StreamEventKind.TOOL_CALL,
+                yield ProviderEvent(
+                    ProviderEventKind.TOOL_CALL,
                     tool_call=ToolCall(str(state["id"]), str(state["name"]), arguments_json),
                 )
         elif not saw_text or stop_reason not in {None, "end_turn", "stop_sequence"}:
             raise ProviderError(ProviderErrorKind.INVALID_STREAM)
-        yield StreamEvent(StreamEventKind.DONE)
+        if saw_usage:
+            yield ProviderEvent(
+                ProviderEventKind.TOKEN_USAGE,
+                usage=TokenUsage(input_tokens, output_tokens),
+            )
+        yield ProviderEvent(ProviderEventKind.DONE)

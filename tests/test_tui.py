@@ -10,8 +10,9 @@ from rich.console import Console
 from textual import events
 from textual.widgets import Markdown, Static
 
+from mewcode.agent import AgentMode
 from mewcode.errors import ProviderError, ProviderErrorKind
-from mewcode.models import ChatMessage, StreamEvent, StreamEventKind
+from mewcode.models import ChatMessage, ProviderEvent, ProviderEventKind, TokenUsage
 from mewcode.session import ChatSession
 from mewcode.tools import CommandApprovalRequest, ToolCall, ToolContext, ToolResult
 from mewcode.tui import (
@@ -29,11 +30,11 @@ from mewcode.tui import (
 
 
 class QueueProvider:
-    def __init__(self, rounds: list[list[StreamEvent | BaseException]]) -> None:
+    def __init__(self, rounds: list[list[ProviderEvent | BaseException]]) -> None:
         self.rounds = rounds
         self.requests: list[tuple[ChatMessage, ...]] = []
 
-    async def stream(self, messages: Sequence[ChatMessage]) -> AsyncIterator[StreamEvent]:
+    async def stream(self, messages: Sequence[ChatMessage]) -> AsyncIterator[ProviderEvent]:
         self.requests.append(tuple(messages))
         for item in self.rounds.pop(0):
             if isinstance(item, BaseException):
@@ -47,13 +48,13 @@ class BlockingProvider:
         self.started = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def stream(self, messages: Sequence[ChatMessage]) -> AsyncIterator[StreamEvent]:
+    async def stream(self, messages: Sequence[ChatMessage]) -> AsyncIterator[ProviderEvent]:
         self.requests.append(tuple(messages))
-        yield StreamEvent(StreamEventKind.TEXT_DELTA, "部分")
+        yield ProviderEvent(ProviderEventKind.TEXT_DELTA, "部分")
         self.started.set()
         await self.release.wait()
-        yield StreamEvent(StreamEventKind.TEXT_DELTA, "完成")
-        yield StreamEvent(StreamEventKind.DONE)
+        yield ProviderEvent(ProviderEventKind.TEXT_DELTA, "完成")
+        yield ProviderEvent(ProviderEventKind.DONE)
 
 
 def make_app(provider: object) -> MewCodeApp:
@@ -79,10 +80,10 @@ async def test_enter_submits_and_streams_into_one_assistant_message() -> None:
     provider = QueueProvider(
         [
             [
-                StreamEvent(StreamEventKind.THINKING_DELTA, "先想"),
-                StreamEvent(StreamEventKind.TEXT_DELTA, "你"),
-                StreamEvent(StreamEventKind.TEXT_DELTA, "好"),
-                StreamEvent(StreamEventKind.DONE),
+                ProviderEvent(ProviderEventKind.THINKING_DELTA, "先想"),
+                ProviderEvent(ProviderEventKind.TEXT_DELTA, "你"),
+                ProviderEvent(ProviderEventKind.TEXT_DELTA, "好"),
+                ProviderEvent(ProviderEventKind.DONE),
             ]
         ]
     )
@@ -101,6 +102,46 @@ async def test_enter_submits_and_streams_into_one_assistant_message() -> None:
         assert message.query_one("#thinking-content", Static).content == "先想"
         assert message.query_one("#answer-content", Markdown).source == "你好"
         assert app.query_one(ComposerTextArea).text == ""
+        app.exit()
+
+
+@pytest.mark.asyncio
+async def test_plan_do_mode_and_usage_status() -> None:
+    provider = QueueProvider(
+        [
+            [
+                ProviderEvent(ProviderEventKind.TEXT_DELTA, "计划"),
+                ProviderEvent(ProviderEventKind.TOKEN_USAGE, usage=TokenUsage(5, 2)),
+                ProviderEvent(ProviderEventKind.DONE),
+            ],
+            [
+                ProviderEvent(ProviderEventKind.TEXT_DELTA, "执行"),
+                ProviderEvent(ProviderEventKind.TOKEN_USAGE, usage=TokenUsage(3, 1)),
+                ProviderEvent(ProviderEventKind.DONE),
+            ],
+        ]
+    )
+    app = make_app(provider)
+    async with app.run_test() as pilot:
+        composer = app.query_one(ComposerTextArea)
+        composer.load_text("/plan 调查")
+        await app.action_submit()
+        await pilot.pause()
+        assert app.mode == AgentMode.PLAN
+        assert "Plan" in str(app.query_one("#composer-status", Static).content)
+        composer.load_text("/do")
+        await app.action_submit()
+        await pilot.pause()
+        status = str(app.query_one("#composer-status", Static).content)
+        assert app.mode == AgentMode.NORMAL
+        assert "Normal" in status
+        assert "Token 4" in status
+        assert [entry.role for entry in app.transcript] == [
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+        ]
         app.exit()
 
 
@@ -182,7 +223,10 @@ async def test_provider_error_keeps_draft_and_allows_next_round(
     provider = QueueProvider(
         [
             [ProviderError(error_kind)],
-            [StreamEvent(StreamEventKind.TEXT_DELTA, "恢复"), StreamEvent(StreamEventKind.DONE)],
+            [
+                ProviderEvent(ProviderEventKind.TEXT_DELTA, "恢复"),
+                ProviderEvent(ProviderEventKind.DONE),
+            ],
         ]
     )
     session = ChatSession(provider)
@@ -202,6 +246,20 @@ async def test_provider_error_keeps_draft_and_allows_next_round(
             ChatMessage("user", "next"),
             ChatMessage("assistant", "恢复"),
         )
+        app.exit()
+
+
+@pytest.mark.asyncio
+async def test_invalid_stream_after_partial_text_adds_visible_status() -> None:
+    provider = QueueProvider([[ProviderEvent(ProviderEventKind.TEXT_DELTA, "部分")]])
+    app = make_app(provider)
+    async with app.run_test() as pilot:
+        await pilot.press("q", "enter")
+        await pilot.pause()
+        assert app.transcript[1].content == "部分"
+        assert app.transcript[1].state == "error"
+        assert app.transcript[2].role == "status"
+        assert "无效" in app.transcript[2].content
         app.exit()
 
 
@@ -305,12 +363,12 @@ async def test_tool_events_update_one_tool_message_and_final_answer(tmp_path: Pa
     provider = QueueProvider(
         [
             [
-                StreamEvent(StreamEventKind.TOOL_CALL, tool_call=call),
-                StreamEvent(StreamEventKind.DONE),
+                ProviderEvent(ProviderEventKind.TOOL_CALL, tool_call=call),
+                ProviderEvent(ProviderEventKind.DONE),
             ],
             [
-                StreamEvent(StreamEventKind.TEXT_DELTA, "读取完成"),
-                StreamEvent(StreamEventKind.DONE),
+                ProviderEvent(ProviderEventKind.TEXT_DELTA, "读取完成"),
+                ProviderEvent(ProviderEventKind.DONE),
             ],
         ]
     )
@@ -385,18 +443,22 @@ def test_static_transcript_renders_bounded_tool_status() -> None:
 
 
 @pytest.mark.asyncio
-async def test_limit_marks_second_tool_as_not_executed(tmp_path: Path) -> None:
+async def test_multiple_tool_iterations_continue_to_final_answer(tmp_path: Path) -> None:
     first = ToolCall("first", "read_file", '{"path":"demo.txt"}')
     second = ToolCall("second", "read_file", '{"path":"other.txt"}')
     provider = QueueProvider(
         [
             [
-                StreamEvent(StreamEventKind.TOOL_CALL, tool_call=first),
-                StreamEvent(StreamEventKind.DONE),
+                ProviderEvent(ProviderEventKind.TOOL_CALL, tool_call=first),
+                ProviderEvent(ProviderEventKind.DONE),
             ],
             [
-                StreamEvent(StreamEventKind.TOOL_CALL, tool_call=second),
-                StreamEvent(StreamEventKind.DONE),
+                ProviderEvent(ProviderEventKind.TOOL_CALL, tool_call=second),
+                ProviderEvent(ProviderEventKind.DONE),
+            ],
+            [
+                ProviderEvent(ProviderEventKind.TEXT_DELTA, "全部完成"),
+                ProviderEvent(ProviderEventKind.DONE),
             ],
         ]
     )
@@ -409,8 +471,13 @@ async def test_limit_marks_second_tool_as_not_executed(tmp_path: Path) -> None:
         await pilot.press("连", "续", "enter")
         await pilot.pause()
         second_entry = next(entry for entry in app.transcript if entry.call_id == "second")
-        assert second_entry.state == "error"
-        assert second_entry.content.startswith("未执行")
+        assert second_entry.state == "complete"
         assistant = next(entry for entry in app.transcript if entry.role == "assistant")
-        assert assistant.content == "本回合未生成最终答复。"
+        assert assistant.content == "全部完成"
+        assert [entry.role for entry in app.transcript] == [
+            "user",
+            "tool",
+            "tool",
+            "assistant",
+        ]
         app.exit()

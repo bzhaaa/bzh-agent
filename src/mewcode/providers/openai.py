@@ -13,8 +13,9 @@ from mewcode.errors import ProviderError, ProviderErrorKind
 from mewcode.models import (
     AssistantMessage,
     ChatMessage,
-    StreamEvent,
-    StreamEventKind,
+    ProviderEvent,
+    ProviderEventKind,
+    TokenUsage,
     ToolResultMessage,
     UserMessage,
 )
@@ -74,13 +75,14 @@ class OpenAIProvider:
         self,
         messages: Sequence[ChatMessage],
         tools: Sequence[ToolDefinition] = (),
-    ) -> AsyncIterator[StreamEvent]:
+    ) -> AsyncIterator[ProviderEvent]:
         """发起请求并逐个产生统一事件。"""
 
         saw_text = False
         saw_stop = False
         finish_reason: str | None = None
         calls: dict[int, dict[str, str]] = {}
+        usage: TokenUsage | None = None
         stream: Any | None = None
         try:
             request: dict[str, object] = {
@@ -88,6 +90,7 @@ class OpenAIProvider:
                 "messages": self._messages(messages),
                 "max_tokens": DEFAULT_MAX_TOKENS,
                 "stream": True,
+                "stream_options": {"include_usage": True},
             }
             if tools:
                 request["tools"] = [
@@ -107,6 +110,18 @@ class OpenAIProvider:
                 choices = getattr(chunk, "choices", None)
                 if not isinstance(choices, list):
                     raise ProviderError(ProviderErrorKind.INVALID_STREAM)
+                raw_usage = getattr(chunk, "usage", None)
+                if raw_usage is not None:
+                    if usage is not None:
+                        raise ProviderError(ProviderErrorKind.INVALID_STREAM)
+                    input_tokens = getattr(raw_usage, "prompt_tokens", None)
+                    output_tokens = getattr(raw_usage, "completion_tokens", None)
+                    if not all(
+                        value is None or isinstance(value, int) and value >= 0
+                        for value in (input_tokens, output_tokens)
+                    ):
+                        raise ProviderError(ProviderErrorKind.INVALID_STREAM)
+                    usage = TokenUsage(input_tokens, output_tokens)
                 for choice in choices:
                     if getattr(choice, "index", 0) != 0:
                         raise ProviderError(ProviderErrorKind.INVALID_STREAM)
@@ -122,7 +137,7 @@ class OpenAIProvider:
                         raise ProviderError(ProviderErrorKind.INVALID_STREAM)
                     if content:
                         saw_text = True
-                        yield StreamEvent(StreamEventKind.TEXT_DELTA, content)
+                        yield ProviderEvent(ProviderEventKind.TEXT_DELTA, content)
                     tool_calls = getattr(delta, "tool_calls", None)
                     if tool_calls is None:
                         continue
@@ -191,8 +206,8 @@ class OpenAIProvider:
                     raise ProviderError(ProviderErrorKind.INVALID_STREAM) from error
                 if not isinstance(arguments, dict):
                     raise ProviderError(ProviderErrorKind.INVALID_STREAM)
-                yield StreamEvent(
-                    StreamEventKind.TOOL_CALL,
+                yield ProviderEvent(
+                    ProviderEventKind.TOOL_CALL,
                     tool_call=ToolCall(state["id"], state["name"], state["arguments"]),
                 )
         elif finish_reason == "stop":
@@ -200,4 +215,6 @@ class OpenAIProvider:
                 raise ProviderError(ProviderErrorKind.INVALID_STREAM)
         else:
             raise ProviderError(ProviderErrorKind.INVALID_STREAM)
-        yield StreamEvent(StreamEventKind.DONE)
+        if usage is not None:
+            yield ProviderEvent(ProviderEventKind.TOKEN_USAGE, usage=usage)
+        yield ProviderEvent(ProviderEventKind.DONE)

@@ -4,7 +4,7 @@ import fnmatch
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from mewcode.tools.base import ToolContext, ToolDefinition
+from mewcode.tools.base import ToolContext, ToolDefinition, ToolExecutionPolicy
 from mewcode.tools.paths import ProjectPaths
 
 
@@ -24,6 +24,7 @@ def matches_glob(path: str, pattern: str) -> bool:
 class FindFilesTool:
     argument_model = FindFilesArguments
     requires_approval = False
+    policy = ToolExecutionPolicy.PARALLEL_READ
     definition = ToolDefinition(
         "find_files",
         "按相对 glob 模式查找项目内普通文件。",

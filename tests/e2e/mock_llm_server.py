@@ -4,19 +4,74 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 
-def select_calls(prompt: str) -> list[tuple[str, dict[str, object]]]:
+def select_calls(prompt: str, step: int) -> list[tuple[str, dict[str, object]]]:
+    if "三步任务" in prompt:
+        sequence = [
+            [
+                ("read_file", {"path": "sample.txt"}),
+                ("find_files", {"pattern": "**/*.txt"}),
+            ],
+            [("search_code", {"query": "needle", "file_pattern": "**/*.txt"})],
+            [("write_file", {"path": "agent-loop.txt", "content": "agent-loop\n"})],
+        ]
+        return sequence[step] if step < len(sequence) else []
+    if "并发调度" in prompt:
+        sequence = [
+            [
+                ("read_file", {"path": "sample.txt"}),
+                ("find_files", {"pattern": "**/*.txt"}),
+            ],
+            [("write_file", {"path": "generated.txt", "content": "alpha\n"})],
+            [
+                ("read_file", {"path": "generated.txt"}),
+                ("search_code", {"query": "alpha", "file_pattern": "**/*.txt"}),
+            ],
+            [
+                (
+                    "edit_file",
+                    {"path": "generated.txt", "old_text": "alpha", "new_text": "beta"},
+                )
+            ],
+        ]
+        return sequence[step] if step < len(sequence) else []
+    if "只读 Plan Mode" in prompt or "继续在只读 Plan Mode" in prompt:
+        sequence = [
+            [
+                ("read_file", {"path": "sample.txt"}),
+                ("find_files", {"pattern": "**/*.txt"}),
+            ],
+            [("search_code", {"query": "needle", "file_pattern": "**/*.txt"})],
+        ]
+        return sequence[step] if step < len(sequence) else []
+    if "退出 Plan Mode" in prompt:
+        return (
+            [("write_file", {"path": "plan-result.txt", "content": "planned\n"})]
+            if step == 0
+            else []
+        )
+    if "未知工具" in prompt:
+        return [("missing_tool", {})]
+    if "取消并发读" in prompt:
+        return [
+            ("find_files", {"pattern": "**/*", "max_results": 1000}),
+            ("search_code", {"query": "never-a", "file_pattern": "**/*"}),
+            ("search_code", {"query": "never-b", "file_pattern": "**/*"}),
+        ]
+    if "迭代上限" in prompt or "连续工具" in prompt:
+        return [("read_file", {"path": "sample.txt"})]
+    if step > 0:
+        return []
     if "多个工具" in prompt:
         return [
             ("read_file", {"path": "sample.txt"}),
             ("find_files", {"pattern": "**/*.txt"}),
         ]
-    if "连续工具" in prompt:
-        return [("read_file", {"path": "sample.txt"})]
     if "新建" in prompt:
         return [("write_file", {"path": "generated.txt", "content": "alpha\n"})]
     if "修改零匹配" in prompt:
@@ -77,19 +132,43 @@ def prompt_from_messages(messages: list[dict[str, Any]]) -> str:
     return ""
 
 
-def has_tool_result(messages: list[dict[str, Any]]) -> bool:
-    if not messages:
-        return False
-    message = messages[-1]
-    if message.get("role") == "tool":
-        return True
-    content = message.get("content")
-    return isinstance(content, list) and any(
-        isinstance(block, dict) and block.get("type") == "tool_result" for block in content
-    )
+def current_tool_step(messages: list[dict[str, Any]]) -> int:
+    """统计最近一条字符串用户消息之后的完整工具请求次数。"""
+
+    start = 0
+    for index, message in enumerate(messages):
+        if message.get("role") == "user" and isinstance(message.get("content"), str):
+            start = index + 1
+    count = 0
+    for message in messages[start:]:
+        if message.get("role") != "assistant":
+            continue
+        if isinstance(message.get("tool_calls"), list) and message["tool_calls"]:
+            count += 1
+            continue
+        content = message.get("content")
+        if isinstance(content, list) and any(
+            isinstance(block, dict) and block.get("type") == "tool_use" for block in content
+        ):
+            count += 1
+    return count
 
 
-def openai_sse(calls: list[tuple[str, dict[str, object]]], final: bool) -> str:
+def final_text(prompt: str) -> str:
+    if "只读 Plan Mode" in prompt or "继续在只读 Plan Mode" in prompt:
+        return "调查完成。计划：根据搜索结果更新目标文件，然后运行验证。"
+    if "退出 Plan Mode" in prompt:
+        return "计划已经执行完成。"
+    return "工具结果已收到，已完成请求。"
+
+
+def openai_sse(
+    calls: list[tuple[str, dict[str, object]]],
+    final: bool,
+    *,
+    prompt: str,
+    step: int,
+) -> str:
     chunks: list[dict[str, object]] = []
     if final and not calls:
         chunks.extend(
@@ -102,7 +181,7 @@ def openai_sse(calls: list[tuple[str, dict[str, object]]], final: bool) -> str:
                     "choices": [
                         {
                             "index": 0,
-                            "delta": {"content": "工具结果已收到，"},
+                            "delta": {"content": final_text(prompt)[:8]},
                             "finish_reason": None,
                         }
                     ],
@@ -113,7 +192,11 @@ def openai_sse(calls: list[tuple[str, dict[str, object]]], final: bool) -> str:
                     "created": 1,
                     "model": "mock",
                     "choices": [
-                        {"index": 0, "delta": {"content": "已完成请求。"}, "finish_reason": "stop"}
+                        {
+                            "index": 0,
+                            "delta": {"content": final_text(prompt)[8:]},
+                            "finish_reason": "stop",
+                        }
                     ],
                 },
             ]
@@ -127,7 +210,7 @@ def openai_sse(calls: list[tuple[str, dict[str, object]]], final: bool) -> str:
             first_fragments.append(
                 {
                     "index": index,
-                    "id": f"call-{index + 1}",
+                    "id": f"call-{step + 1}-{index + 1}",
                     "type": "function",
                     "function": {"name": name, "arguments": encoded[:split]},
                 }
@@ -184,13 +267,28 @@ def openai_sse(calls: list[tuple[str, dict[str, object]]], final: bool) -> str:
                 ],
             }
         )
+    usage = {
+        "id": "chat-usage",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "mock",
+        "choices": [],
+        "usage": {"prompt_tokens": 10 + step, "completion_tokens": 3},
+    }
+    chunks.append(usage)
     return (
         "".join(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n" for chunk in chunks)
         + "data: [DONE]\n\n"
     )
 
 
-def anthropic_sse(calls: list[tuple[str, dict[str, object]]], final: bool) -> str:
+def anthropic_sse(
+    calls: list[tuple[str, dict[str, object]]],
+    final: bool,
+    *,
+    prompt: str,
+    step: int,
+) -> str:
     events: list[tuple[str, dict[str, object]]] = [
         (
             "message_start",
@@ -225,7 +323,7 @@ def anthropic_sse(calls: list[tuple[str, dict[str, object]]], final: bool) -> st
                     {
                         "type": "content_block_delta",
                         "index": 0,
-                        "delta": {"type": "text_delta", "text": "工具结果已收到，已完成请求。"},
+                        "delta": {"type": "text_delta", "text": final_text(prompt)},
                     },
                 ),
                 ("content_block_stop", {"type": "content_block_stop", "index": 0}),
@@ -245,7 +343,7 @@ def anthropic_sse(calls: list[tuple[str, dict[str, object]]], final: bool) -> st
                             "index": index,
                             "content_block": {
                                 "type": "tool_use",
-                                "id": f"tool-{index + 1}",
+                                "id": f"tool-{step + 1}-{index + 1}",
                                 "name": name,
                                 "input": {},
                             },
@@ -321,25 +419,67 @@ class Handler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length))
         messages = body.get("messages", [])
         prompt = prompt_from_messages(messages)
-        final = has_tool_result(messages)
-        calls = select_calls(prompt)
-        if final and "连续工具" not in prompt:
-            calls = []
+        step = current_tool_step(messages)
+        calls = select_calls(prompt, step)
+        final = step > 0 and not calls
         protocol = "openai" if self.path.endswith("/chat/completions") else "anthropic"
         with self.log_path.open("a", encoding="utf-8") as handle:
             handle.write(
                 json.dumps(
-                    {"protocol": protocol, "prompt": prompt, "final": final, "calls": len(calls)},
+                    {
+                        "timestamp": time.time(),
+                        "protocol": protocol,
+                        "prompt": prompt,
+                        "step": step,
+                        "final": final,
+                        "calls": [name for name, _arguments in calls],
+                        "tools": [
+                            tool.get("function", {}).get("name", "")
+                            if protocol == "openai"
+                            else tool.get("name", "")
+                            for tool in body.get("tools", [])
+                        ],
+                        "messages": messages,
+                    },
                     ensure_ascii=False,
                 )
                 + "\n"
             )
-        payload = openai_sse(calls, final) if protocol == "openai" else anthropic_sse(calls, final)
+        if "流错误" in prompt:
+            payload = (
+                'data: {"id":"broken","object":"chat.completion.chunk","created":1,'
+                '"model":"mock","choices":[{"index":0,"delta":{"content":"部分"},'
+                '"finish_reason":null}]}\n\ndata: [DONE]\n\n'
+                if protocol == "openai"
+                else (
+                    "event: message_start\n"
+                    'data: {"type":"message_start","message":'
+                    '{"usage":{"input_tokens":1}}}\n\n'
+                )
+            )
+        else:
+            payload = (
+                openai_sse(calls, final, prompt=prompt, step=step)
+                if protocol == "openai"
+                else anthropic_sse(calls, final, prompt=prompt, step=step)
+            )
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
-        self.wfile.write(payload.encode("utf-8"))
-        self.wfile.flush()
+        encoded = payload.encode("utf-8")
+        if "长模型" in prompt and len(encoded) > 1:
+            split = len(encoded) // 2
+            try:
+                self.wfile.write(encoded[:split])
+                self.wfile.flush()
+                time.sleep(30)
+                self.wfile.write(encoded[split:])
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                return
+        else:
+            self.wfile.write(encoded)
+            self.wfile.flush()
 
     def log_message(self, _format: str, *_args: object) -> None:
         return
@@ -351,7 +491,13 @@ def main() -> None:
     parser.add_argument("--log", type=Path, required=True)
     arguments = parser.parse_args()
     Handler.log_path = arguments.log
-    ThreadingHTTPServer(("127.0.0.1", arguments.port), Handler).serve_forever()
+    server = ThreadingHTTPServer(("127.0.0.1", arguments.port), Handler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":

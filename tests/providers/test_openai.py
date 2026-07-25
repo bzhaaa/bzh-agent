@@ -13,7 +13,8 @@ from mewcode.errors import ProviderError, ProviderErrorKind
 from mewcode.models import (
     AssistantMessage,
     ChatMessage,
-    StreamEventKind,
+    ProviderEventKind,
+    TokenUsage,
     ToolResultMessage,
     UserMessage,
 )
@@ -79,15 +80,16 @@ async def test_openai_request_and_stream_events() -> None:
     provider = OpenAIProvider(make_profile(), client)
     result = [event async for event in provider.stream([ChatMessage("user", "问")])]
     assert [(event.kind, event.delta) for event in result] == [
-        (StreamEventKind.TEXT_DELTA, "你"),
-        (StreamEventKind.TEXT_DELTA, "好"),
-        (StreamEventKind.DONE, ""),
+        (ProviderEventKind.TEXT_DELTA, "你"),
+        (ProviderEventKind.TEXT_DELTA, "好"),
+        (ProviderEventKind.DONE, ""),
     ]
     assert completions.arguments == {
         "model": "gpt-test",
         "messages": [{"role": "user", "content": "问"}],
         "max_tokens": 4096,
         "stream": True,
+        "stream_options": {"include_usage": True},
     }
     assert completions.stream is not None
     assert completions.stream.closed
@@ -129,9 +131,9 @@ data: [DONE]
     finally:
         await provider.close()
     assert [(event.kind, event.delta) for event in result] == [
-        (StreamEventKind.TEXT_DELTA, "你"),
-        (StreamEventKind.TEXT_DELTA, "好"),
-        (StreamEventKind.DONE, ""),
+        (ProviderEventKind.TEXT_DELTA, "你"),
+        (ProviderEventKind.TEXT_DELTA, "好"),
+        (ProviderEventKind.DONE, ""),
     ]
 
 
@@ -212,13 +214,43 @@ async def test_openai_collects_fragmented_tool_call_after_stream_end() -> None:
     )
     result = [event async for event in provider.stream([UserMessage("问")], [definition])]
     assert [event.kind for event in result] == [
-        StreamEventKind.TEXT_DELTA,
-        StreamEventKind.TOOL_CALL,
-        StreamEventKind.DONE,
+        ProviderEventKind.TEXT_DELTA,
+        ProviderEventKind.TOOL_CALL,
+        ProviderEventKind.DONE,
     ]
     assert result[1].tool_call == ToolCall("call-1", "read_file", '{"path":"a.txt"}')
     assert completions.arguments["tool_choice"] == "auto"
     assert completions.arguments["tools"][0]["function"]["name"] == "read_file"
+
+
+@pytest.mark.asyncio
+async def test_openai_emits_normalized_usage_chunk() -> None:
+    chunks = [
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    index=0,
+                    delta=SimpleNamespace(content="答"),
+                    finish_reason="stop",
+                )
+            ]
+        ),
+        SimpleNamespace(
+            choices=[],
+            usage=SimpleNamespace(prompt_tokens=12, completion_tokens=4),
+        ),
+    ]
+    provider = OpenAIProvider(
+        make_profile(),
+        SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions(chunks))),
+    )
+    result = [event async for event in provider.stream([UserMessage("问")])]
+    assert [event.kind for event in result] == [
+        ProviderEventKind.TEXT_DELTA,
+        ProviderEventKind.TOKEN_USAGE,
+        ProviderEventKind.DONE,
+    ]
+    assert result[1].usage == TokenUsage(12, 4)
 
 
 def test_openai_converts_complete_tool_history() -> None:
@@ -293,3 +325,39 @@ async def test_openai_rejects_incomplete_or_conflicting_tool_stream() -> None:
     with pytest.raises(ProviderError) as caught:
         _ = [event async for event in provider.stream([UserMessage("问")])]
     assert caught.value.kind == ProviderErrorKind.INVALID_STREAM
+
+
+@pytest.mark.asyncio
+async def test_openai_preserves_multiple_tool_call_order() -> None:
+    calls = [
+        SimpleNamespace(
+            index=1,
+            id="b",
+            type="function",
+            function=SimpleNamespace(name="find_files", arguments='{"pattern":"*.py"}'),
+        ),
+        SimpleNamespace(
+            index=0,
+            id="a",
+            type="function",
+            function=SimpleNamespace(name="read_file", arguments='{"path":"a.py"}'),
+        ),
+    ]
+    chunks = [
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    index=0,
+                    delta=SimpleNamespace(content=None, tool_calls=calls),
+                    finish_reason="tool_calls",
+                )
+            ]
+        )
+    ]
+    provider = OpenAIProvider(
+        make_profile(),
+        SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions(chunks))),
+    )
+    result = [event async for event in provider.stream([UserMessage("问")])]
+    tool_calls = [event.tool_call for event in result if event.tool_call is not None]
+    assert [call.id for call in tool_calls] == ["a", "b"]

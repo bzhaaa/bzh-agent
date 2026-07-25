@@ -1,9 +1,11 @@
 """工具注册中心和默认工具集合。"""
 
-import re
-from collections.abc import Iterable
+from __future__ import annotations
 
-from mewcode.tools.base import Tool, ToolDefinition
+import re
+from collections.abc import Collection, Iterable
+
+from mewcode.tools.base import Tool, ToolDefinition, ToolExecutionPolicy
 from mewcode.tools.edit_file import EditFileTool
 from mewcode.tools.execute_command import ExecuteCommandTool
 from mewcode.tools.find_files import FindFilesTool
@@ -24,6 +26,8 @@ class ToolRegistry:
 
     def register(self, tool: Tool) -> None:
         definition = tool.definition
+        if not isinstance(getattr(tool, "policy", None), ToolExecutionPolicy):
+            raise ValueError(f"工具 {definition.name} 缺少有效执行策略。")
         if not TOOL_NAME_PATTERN.fullmatch(definition.name):
             raise ValueError("工具名必须使用小写 snake_case。")
         if not definition.description.strip():
@@ -40,6 +44,13 @@ class ToolRegistry:
 
     def definitions(self) -> tuple[ToolDefinition, ...]:
         return tuple(tool.definition for tool in self._tools.values())
+
+    def subset(self, names: Collection[str]) -> ToolRegistry:
+        requested = set(names)
+        missing = requested.difference(self._tools)
+        if missing:
+            raise ValueError(f"工具不存在：{', '.join(sorted(missing))}")
+        return ToolRegistry(tool for name, tool in self._tools.items() if name in requested)
 
 
 def create_default_registry() -> ToolRegistry:

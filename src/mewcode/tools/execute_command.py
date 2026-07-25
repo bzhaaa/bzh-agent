@@ -8,7 +8,7 @@ import signal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from mewcode.tools.base import ToolContext, ToolDefinition
+from mewcode.tools.base import ToolContext, ToolDefinition, ToolExecutionPolicy
 from mewcode.tools.errors import ToolError, ToolErrorCode
 
 MAX_OUTPUT_BYTES = 64_000
@@ -55,6 +55,7 @@ async def _stop_process_group(process: asyncio.subprocess.Process) -> None:
 class ExecuteCommandTool:
     argument_model = ExecuteCommandArguments
     requires_approval = True
+    policy = ToolExecutionPolicy.SERIAL_SIDE_EFFECT
     definition = ToolDefinition(
         "execute_command",
         "在项目根目录执行完整 Shell 命令；每次执行前都需要用户确认。",

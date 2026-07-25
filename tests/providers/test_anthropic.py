@@ -15,7 +15,8 @@ from mewcode.errors import ProviderError, ProviderErrorKind
 from mewcode.models import (
     AssistantMessage,
     ChatMessage,
-    StreamEventKind,
+    ProviderEventKind,
+    TokenUsage,
     ToolResultMessage,
     UserMessage,
 )
@@ -87,9 +88,9 @@ async def test_anthropic_request_and_stream_events(
     provider = AnthropicProvider(make_profile(thinking), SimpleNamespace(messages=messages))
     result = [event async for event in provider.stream([ChatMessage("user", "问")])]
     assert [event.kind for event in result] == [
-        StreamEventKind.THINKING_DELTA,
-        StreamEventKind.TEXT_DELTA,
-        StreamEventKind.DONE,
+        ProviderEventKind.THINKING_DELTA,
+        ProviderEventKind.TEXT_DELTA,
+        ProviderEventKind.DONE,
     ]
     assert messages.arguments is not None
     assert messages.arguments["model"] == "claude-test"
@@ -152,10 +153,12 @@ data: {"type":"message_stop"}
     finally:
         await provider.close()
     assert [(event.kind, event.delta) for event in result] == [
-        (StreamEventKind.THINKING_DELTA, "想"),
-        (StreamEventKind.TEXT_DELTA, "答"),
-        (StreamEventKind.DONE, ""),
+        (ProviderEventKind.THINKING_DELTA, "想"),
+        (ProviderEventKind.TEXT_DELTA, "答"),
+        (ProviderEventKind.TOKEN_USAGE, ""),
+        (ProviderEventKind.DONE, ""),
     ]
+    assert result[2].usage == TokenUsage(1, 2)
 
 
 @pytest.mark.asyncio
@@ -212,8 +215,8 @@ async def test_anthropic_collects_fragmented_tool_call_after_message_stop() -> N
     )
     result = [event async for event in provider.stream([UserMessage("问")], [definition])]
     assert [event.kind for event in result] == [
-        StreamEventKind.TOOL_CALL,
-        StreamEventKind.DONE,
+        ProviderEventKind.TOOL_CALL,
+        ProviderEventKind.DONE,
     ]
     assert result[0].tool_call == ToolCall("tool-1", "read_file", '{"path":"a.txt"}')
     assert messages.arguments["tools"][0]["input_schema"]["type"] == "object"
@@ -256,3 +259,78 @@ async def test_anthropic_rejects_unclosed_tool_block() -> None:
     with pytest.raises(ProviderError) as caught:
         _ = [event async for event in provider.stream([UserMessage("问")])]
     assert caught.value.kind == ProviderErrorKind.INVALID_STREAM
+
+
+@pytest.mark.asyncio
+async def test_anthropic_usage_includes_cache_tokens() -> None:
+    events = [
+        SimpleNamespace(
+            type="message_start",
+            message=SimpleNamespace(
+                usage=SimpleNamespace(
+                    input_tokens=2,
+                    cache_creation_input_tokens=3,
+                    cache_read_input_tokens=4,
+                )
+            ),
+        ),
+        SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(type="text_delta", text="答"),
+        ),
+        SimpleNamespace(
+            type="message_delta",
+            delta=SimpleNamespace(stop_reason="end_turn"),
+            usage=SimpleNamespace(output_tokens=5),
+        ),
+        SimpleNamespace(type="message_stop"),
+    ]
+    provider = AnthropicProvider(
+        make_profile(),
+        SimpleNamespace(messages=FakeMessages(events)),
+    )
+    result = [event async for event in provider.stream([UserMessage("问")])]
+    usage = next(event.usage for event in result if event.usage is not None)
+    assert usage == TokenUsage(9, 5)
+
+
+@pytest.mark.asyncio
+async def test_anthropic_preserves_multiple_tool_block_order() -> None:
+    events = []
+    for index, (call_id, name) in enumerate((("a", "read_file"), ("b", "find_files"))):
+        events.extend(
+            [
+                SimpleNamespace(
+                    type="content_block_start",
+                    index=index,
+                    content_block=SimpleNamespace(
+                        type="tool_use",
+                        id=call_id,
+                        name=name,
+                        input={},
+                    ),
+                ),
+                SimpleNamespace(
+                    type="content_block_delta",
+                    index=index,
+                    delta=SimpleNamespace(type="input_json_delta", partial_json="{}"),
+                ),
+                SimpleNamespace(type="content_block_stop", index=index),
+            ]
+        )
+    events.extend(
+        [
+            SimpleNamespace(
+                type="message_delta",
+                delta=SimpleNamespace(stop_reason="tool_use"),
+            ),
+            SimpleNamespace(type="message_stop"),
+        ]
+    )
+    provider = AnthropicProvider(
+        make_profile(),
+        SimpleNamespace(messages=FakeMessages(events)),
+    )
+    result = [event async for event in provider.stream([UserMessage("问")])]
+    calls = [event.tool_call for event in result if event.tool_call is not None]
+    assert [call.id for call in calls] == ["a", "b"]

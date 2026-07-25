@@ -2,7 +2,7 @@
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from mewcode.tools.base import ToolContext, ToolDefinition
+from mewcode.tools.base import ToolContext, ToolDefinition, ToolExecutionPolicy
 from mewcode.tools.errors import ToolError, ToolErrorCode
 from mewcode.tools.paths import ProjectPaths, atomic_write_text
 from mewcode.tools.write_file import MAX_WRITE_BYTES
@@ -19,6 +19,7 @@ class EditFileArguments(BaseModel):
 class EditFileTool:
     argument_model = EditFileArguments
     requires_approval = False
+    policy = ToolExecutionPolicy.SERIAL_SIDE_EFFECT
     definition = ToolDefinition(
         "edit_file",
         "在项目内文本文件中唯一匹配原文并替换一次。",

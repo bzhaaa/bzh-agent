@@ -3,7 +3,7 @@
 from collections.abc import AsyncIterator, Sequence
 from typing import Protocol, runtime_checkable
 
-from mewcode.models import ChatMessage, StreamEvent
+from mewcode.models import ChatMessage, ProviderEvent
 from mewcode.tools.base import ToolDefinition
 
 DEFAULT_MAX_TOKENS = 4096
@@ -19,6 +19,6 @@ class LLMProvider(Protocol):
         self,
         messages: Sequence[ChatMessage],
         tools: Sequence[ToolDefinition] = (),
-    ) -> AsyncIterator[StreamEvent]:
+    ) -> AsyncIterator[ProviderEvent]:
         """返回统一的异步流事件。"""
         ...

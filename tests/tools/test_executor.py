@@ -12,6 +12,7 @@ from mewcode.tools import (
     ToolContext,
     ToolDefinition,
     ToolErrorCode,
+    ToolExecutionPolicy,
     ToolExecutor,
     ToolRegistry,
     create_default_registry,
@@ -66,6 +67,7 @@ class EmptyArguments(BaseModel):
 class ExplodingTool:
     argument_model = EmptyArguments
     requires_approval = False
+    policy = ToolExecutionPolicy.PARALLEL_READ
     definition = ToolDefinition("explode", "测试异常隔离。", EmptyArguments.model_json_schema())
 
     async def execute(self, arguments: BaseModel, context: ToolContext) -> dict[str, object]:
@@ -94,3 +96,19 @@ async def test_executor_hides_internal_error_and_preserves_cancellation(tmp_path
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+def test_registry_rejects_missing_policy_and_subset_unknown() -> None:
+    class MissingPolicy:
+        argument_model = EmptyArguments
+        requires_approval = False
+        definition = ToolDefinition(
+            "missing_policy",
+            "缺少策略。",
+            EmptyArguments.model_json_schema(),
+        )
+
+    with pytest.raises(ValueError, match="执行策略"):
+        ToolRegistry((MissingPolicy(),))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="不存在"):
+        create_default_registry().subset(("read_file", "missing"))

@@ -5,7 +5,7 @@ import re
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from mewcode.tools.base import ToolContext, ToolDefinition
+from mewcode.tools.base import ToolContext, ToolDefinition, ToolExecutionPolicy
 from mewcode.tools.errors import ToolError, ToolErrorCode
 from mewcode.tools.find_files import matches_glob
 from mewcode.tools.paths import ProjectPaths
@@ -26,6 +26,7 @@ class SearchCodeArguments(BaseModel):
 class SearchCodeTool:
     argument_model = SearchCodeArguments
     requires_approval = False
+    policy = ToolExecutionPolicy.PARALLEL_READ
     definition = ToolDefinition(
         "search_code",
         "在项目文本文件中搜索字面量或正则，支持 glob 过滤。",

@@ -7,6 +7,7 @@ from mewcode.tools.base import (
     ToolCall,
     ToolContext,
     ToolDefinition,
+    ToolExecutionPolicy,
     ToolResult,
 )
 from mewcode.tools.errors import ToolError, ToolErrorCode
@@ -22,6 +23,7 @@ __all__ = [
     "ToolDefinition",
     "ToolError",
     "ToolErrorCode",
+    "ToolExecutionPolicy",
     "ToolExecutor",
     "ToolRegistry",
     "ToolResult",
