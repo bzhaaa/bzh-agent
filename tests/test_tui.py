@@ -3,6 +3,7 @@
 import asyncio
 from collections.abc import AsyncIterator, Sequence
 from io import StringIO
+from pathlib import Path
 
 import pytest
 from rich.console import Console
@@ -12,11 +13,14 @@ from textual.widgets import Markdown, Static
 from mewcode.errors import ProviderError, ProviderErrorKind
 from mewcode.models import ChatMessage, StreamEvent, StreamEventKind
 from mewcode.session import ChatSession
+from mewcode.tools import CommandApprovalRequest, ToolCall, ToolContext, ToolResult
 from mewcode.tui import (
     AssistantMessage,
+    CommandApprovalScreen,
     ComposerTextArea,
     ConversationView,
     MewCodeApp,
+    ToolMessage,
     TranscriptEntry,
     TranscriptSnapshot,
     UserMessage,
@@ -287,4 +291,126 @@ async def test_conversation_follows_bottom_but_not_when_scrolled_up() -> None:
         await conversation.append_message(UserMessage(followed))
         await pilot.pause()
         assert conversation.is_vertical_scroll_end
+        app.exit()
+
+
+class SuccessfulExecutor:
+    async def execute(self, call: ToolCall, context: ToolContext) -> ToolResult:
+        return ToolResult(call.id, call.name, True, {"summary": "读取 1 行。"})
+
+
+@pytest.mark.asyncio
+async def test_tool_events_update_one_tool_message_and_final_answer(tmp_path: Path) -> None:
+    call = ToolCall("tool-1", "read_file", '{"path":"demo.txt"}')
+    provider = QueueProvider(
+        [
+            [
+                StreamEvent(StreamEventKind.TOOL_CALL, tool_call=call),
+                StreamEvent(StreamEventKind.DONE),
+            ],
+            [
+                StreamEvent(StreamEventKind.TEXT_DELTA, "读取完成"),
+                StreamEvent(StreamEventKind.DONE),
+            ],
+        ]
+    )
+    session = ChatSession(provider, executor=SuccessfulExecutor(), context=ToolContext(tmp_path))
+    app = MewCodeApp(session, profile_name="test", model="model")
+    async with app.run_test() as pilot:
+        await pilot.press("读", "取", "enter")
+        await pilot.pause()
+        assert len(app.query(ToolMessage)) == 1
+        tool_entry = next(entry for entry in app.transcript if entry.role == "tool")
+        assert tool_entry.tool_name == "read_file"
+        assert tool_entry.state == "complete"
+        assert tool_entry.content == "读取 1 行。"
+        assistant_entry = next(entry for entry in app.transcript if entry.role == "assistant")
+        assert assistant_entry.content == "读取完成"
+        assert assistant_entry.state == "complete"
+        assert [entry.role for entry in app.transcript] == ["user", "tool", "assistant"]
+        app.exit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "expected"),
+    [
+        ("y", True),
+        ("enter", True),
+        ("n", False),
+        ("escape", False),
+        ("#approve-command", True),
+        ("#reject-command", False),
+    ],
+)
+async def test_command_approval_keyboard_preserves_composer_draft(
+    action: str, expected: bool
+) -> None:
+    app = make_app(QueueProvider([]))
+    request = CommandApprovalRequest("printf ok", "/tmp/project", 30)
+    async with app.run_test() as pilot:
+        composer = app.query_one(ComposerTextArea)
+        composer.load_text("draft\nline")
+        worker = app.run_worker(app.request_command_approval(request), exit_on_error=False)
+        for _ in range(20):
+            await pilot.pause()
+            if isinstance(app.screen, CommandApprovalScreen):
+                break
+        screen = app.screen
+        assert isinstance(screen, CommandApprovalScreen), repr(worker.error)
+        assert "printf ok" in str(screen.query_one("#approval-command", Static).content)
+        if action.startswith("#"):
+            await pilot.click(action)
+        else:
+            await pilot.press(action)
+        assert await worker.wait() is expected
+        assert composer.text == "draft\nline"
+        assert composer.has_focus
+        app.exit()
+
+
+def test_static_transcript_renders_bounded_tool_status() -> None:
+    snapshot = TranscriptSnapshot(
+        (
+            TranscriptEntry("tool", "读取 2 行。", state="complete", tool_name="read_file"),
+            TranscriptEntry("tool", "已拒绝。", state="rejected", tool_name="execute_command"),
+        )
+    )
+    output = StringIO()
+    render_static_transcript(snapshot, Console(file=output, force_terminal=False))
+    rendered = output.getvalue()
+    assert "read_file" in rendered
+    assert "execute_command" in rendered
+    assert "已拒绝" in rendered
+
+
+@pytest.mark.asyncio
+async def test_limit_marks_second_tool_as_not_executed(tmp_path: Path) -> None:
+    first = ToolCall("first", "read_file", '{"path":"demo.txt"}')
+    second = ToolCall("second", "read_file", '{"path":"other.txt"}')
+    provider = QueueProvider(
+        [
+            [
+                StreamEvent(StreamEventKind.TOOL_CALL, tool_call=first),
+                StreamEvent(StreamEventKind.DONE),
+            ],
+            [
+                StreamEvent(StreamEventKind.TOOL_CALL, tool_call=second),
+                StreamEvent(StreamEventKind.DONE),
+            ],
+        ]
+    )
+    app = MewCodeApp(
+        ChatSession(provider, executor=SuccessfulExecutor(), context=ToolContext(tmp_path)),
+        profile_name="test",
+        model="model",
+    )
+    async with app.run_test() as pilot:
+        await pilot.press("连", "续", "enter")
+        await pilot.pause()
+        second_entry = next(entry for entry in app.transcript if entry.call_id == "second")
+        assert second_entry.state == "error"
+        assert second_entry.content.startswith("未执行")
+        assistant = next(entry for entry in app.transcript if entry.role == "assistant")
+        assert assistant.content == "本回合未生成最终答复。"
         app.exit()

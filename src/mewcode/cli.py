@@ -14,6 +14,7 @@ from mewcode.config import ProviderProfile, load_config
 from mewcode.errors import ConfigError
 from mewcode.providers import create_provider
 from mewcode.session import ChatSession
+from mewcode.tools import CommandApprovalRequest, ToolContext, ToolExecutor, create_default_registry
 from mewcode.tui import MewCodeApp, render_static_transcript
 
 
@@ -30,7 +31,23 @@ async def run_app(profile: ProviderProfile, console: Console | None = None) -> N
     output = console or Console()
     provider = create_provider(profile)
     try:
-        app = MewCodeApp(ChatSession(provider), profile_name=profile.name, model=profile.model)
+        project_root = Path.cwd().resolve()
+        registry = create_default_registry()
+        executor = ToolExecutor(registry)
+        approval_target: list[object] = []
+
+        async def request_approval(request: CommandApprovalRequest) -> bool:
+            if not approval_target:
+                return False
+            handler = getattr(approval_target[0], "request_command_approval", None)
+            if handler is None:
+                return False
+            return bool(await handler(request))
+
+        context = ToolContext(project_root, request_approval)
+        session = ChatSession(provider, registry, executor, context)
+        app = MewCodeApp(session, profile_name=profile.name, model=profile.model)
+        approval_target.append(app)
         snapshot = await app.run_async(mouse=True)
         render_static_transcript(snapshot, output)
     finally:

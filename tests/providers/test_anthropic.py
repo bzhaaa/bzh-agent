@@ -12,8 +12,15 @@ import pytest
 
 from mewcode.config import ProviderProfile
 from mewcode.errors import ProviderError, ProviderErrorKind
-from mewcode.models import ChatMessage, StreamEventKind
+from mewcode.models import (
+    AssistantMessage,
+    ChatMessage,
+    StreamEventKind,
+    ToolResultMessage,
+    UserMessage,
+)
 from mewcode.providers.anthropic import AnthropicProvider
+from mewcode.tools import ToolCall, ToolDefinition, ToolResult
 
 
 class FakeManager:
@@ -172,3 +179,80 @@ async def test_anthropic_maps_status_errors(exception_type, expected_kind) -> No
         _ = [event async for event in provider.stream([ChatMessage("user", "问")])]
     assert caught.value.kind == expected_kind
     assert "unsafe-secret" not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_anthropic_collects_fragmented_tool_call_after_message_stop() -> None:
+    events = [
+        SimpleNamespace(
+            type="content_block_start",
+            index=0,
+            content_block=SimpleNamespace(type="tool_use", id="tool-1", name="read_file", input={}),
+        ),
+        SimpleNamespace(
+            type="content_block_delta",
+            index=0,
+            delta=SimpleNamespace(type="input_json_delta", partial_json='{"path"'),
+        ),
+        SimpleNamespace(
+            type="content_block_delta",
+            index=0,
+            delta=SimpleNamespace(type="input_json_delta", partial_json=':"a.txt"}'),
+        ),
+        SimpleNamespace(type="content_block_stop", index=0),
+        SimpleNamespace(type="message_delta", delta=SimpleNamespace(stop_reason="tool_use")),
+        SimpleNamespace(type="message_stop"),
+    ]
+    messages = FakeMessages(events)
+    provider = AnthropicProvider(make_profile(), SimpleNamespace(messages=messages))
+    definition = ToolDefinition(
+        "read_file",
+        "读取文件",
+        {"type": "object", "properties": {}, "additionalProperties": False},
+    )
+    result = [event async for event in provider.stream([UserMessage("问")], [definition])]
+    assert [event.kind for event in result] == [
+        StreamEventKind.TOOL_CALL,
+        StreamEventKind.DONE,
+    ]
+    assert result[0].tool_call == ToolCall("tool-1", "read_file", '{"path":"a.txt"}')
+    assert messages.arguments["tools"][0]["input_schema"]["type"] == "object"
+
+
+def test_anthropic_converts_and_merges_tool_results() -> None:
+    first = ToolCall("a", "read_file", "{}")
+    second = ToolCall("b", "find_files", "{}")
+    messages = AnthropicProvider._messages(
+        [
+            UserMessage("检查"),
+            AssistantMessage("", (first, second)),
+            ToolResultMessage(ToolResult("a", "read_file", True, {"value": 1})),
+            ToolResultMessage(ToolResult("b", "find_files", False, {}, error_message="失败")),
+            AssistantMessage("完成"),
+        ]
+    )
+    assert [item["role"] for item in messages] == ["user", "assistant", "user", "assistant"]
+    assert len(messages[1]["content"]) == 2
+    assert len(messages[2]["content"]) == 2
+    assert messages[2]["content"][1]["is_error"] is True
+
+
+@pytest.mark.asyncio
+async def test_anthropic_rejects_unclosed_tool_block() -> None:
+    events = [
+        SimpleNamespace(
+            type="content_block_start",
+            index=0,
+            content_block=SimpleNamespace(type="tool_use", id="tool-1", name="read_file", input={}),
+        ),
+        SimpleNamespace(
+            type="content_block_delta",
+            index=0,
+            delta=SimpleNamespace(type="input_json_delta", partial_json="{}"),
+        ),
+        SimpleNamespace(type="message_stop"),
+    ]
+    provider = AnthropicProvider(make_profile(), SimpleNamespace(messages=FakeMessages(events)))
+    with pytest.raises(ProviderError) as caught:
+        _ = [event async for event in provider.stream([UserMessage("问")])]
+    assert caught.value.kind == ProviderErrorKind.INVALID_STREAM

@@ -10,8 +10,15 @@ import pytest
 
 from mewcode.config import ProviderProfile
 from mewcode.errors import ProviderError, ProviderErrorKind
-from mewcode.models import ChatMessage, StreamEventKind
+from mewcode.models import (
+    AssistantMessage,
+    ChatMessage,
+    StreamEventKind,
+    ToolResultMessage,
+    UserMessage,
+)
 from mewcode.providers.openai import OpenAIProvider
+from mewcode.tools import ToolCall, ToolDefinition, ToolErrorCode, ToolResult
 
 
 class FakeStream:
@@ -150,3 +157,139 @@ async def test_openai_maps_status_errors(exception_type, expected_kind) -> None:
         _ = [event async for event in provider.stream([ChatMessage("user", "问")])]
     assert caught.value.kind == expected_kind
     assert "unsafe-secret" not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_openai_collects_fragmented_tool_call_after_stream_end() -> None:
+    chunks = [
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    index=0,
+                    delta=SimpleNamespace(
+                        content="先检查",
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id="call-1",
+                                type="function",
+                                function=SimpleNamespace(name="read_file", arguments='{"path"'),
+                            )
+                        ],
+                    ),
+                    finish_reason=None,
+                )
+            ]
+        ),
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    index=0,
+                    delta=SimpleNamespace(
+                        content=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id=None,
+                                type=None,
+                                function=SimpleNamespace(name=None, arguments=':"a.txt"}'),
+                            )
+                        ],
+                    ),
+                    finish_reason="tool_calls",
+                )
+            ]
+        ),
+    ]
+    completions = FakeCompletions(chunks)
+    provider = OpenAIProvider(
+        make_profile(), SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    )
+    definition = ToolDefinition(
+        "read_file",
+        "读取文件",
+        {"type": "object", "properties": {}, "additionalProperties": False},
+    )
+    result = [event async for event in provider.stream([UserMessage("问")], [definition])]
+    assert [event.kind for event in result] == [
+        StreamEventKind.TEXT_DELTA,
+        StreamEventKind.TOOL_CALL,
+        StreamEventKind.DONE,
+    ]
+    assert result[1].tool_call == ToolCall("call-1", "read_file", '{"path":"a.txt"}')
+    assert completions.arguments["tool_choice"] == "auto"
+    assert completions.arguments["tools"][0]["function"]["name"] == "read_file"
+
+
+def test_openai_converts_complete_tool_history() -> None:
+    call = ToolCall("call-1", "read_file", '{"path":"a.txt"}')
+    result = ToolResult(
+        "call-1",
+        "read_file",
+        False,
+        {},
+        error_code=ToolErrorCode.NOT_FOUND,
+        error_message="不存在",
+    )
+    converted = OpenAIProvider._messages(
+        [
+            UserMessage("读取"),
+            AssistantMessage("", (call,)),
+            ToolResultMessage(result),
+            AssistantMessage("文件不存在"),
+        ]
+    )
+    assert converted[1]["tool_calls"][0]["id"] == "call-1"
+    assert converted[2]["role"] == "tool"
+    assert converted[2]["tool_call_id"] == "call-1"
+
+
+@pytest.mark.asyncio
+async def test_openai_rejects_incomplete_or_conflicting_tool_stream() -> None:
+    conflicting = [
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    index=0,
+                    delta=SimpleNamespace(
+                        content=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id="a",
+                                type="function",
+                                function=SimpleNamespace(name="read_file", arguments="{"),
+                            )
+                        ],
+                    ),
+                    finish_reason=None,
+                )
+            ]
+        ),
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    index=0,
+                    delta=SimpleNamespace(
+                        content=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id="b",
+                                type=None,
+                                function=SimpleNamespace(name=None, arguments="}"),
+                            )
+                        ],
+                    ),
+                    finish_reason="tool_calls",
+                )
+            ]
+        ),
+    ]
+    provider = OpenAIProvider(
+        make_profile(),
+        SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions(conflicting))),
+    )
+    with pytest.raises(ProviderError) as caught:
+        _ = [event async for event in provider.stream([UserMessage("问")])]
+    assert caught.value.kind == ProviderErrorKind.INVALID_STREAM

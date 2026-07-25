@@ -144,3 +144,36 @@ async def test_run_app_closes_provider_when_textual_fails(
     with pytest.raises(RuntimeError, match="TUI failed"):
         await cli.run_app(profile)
     assert provider.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_run_app_fixes_tool_root_to_starting_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile = ProviderProfile.model_validate(
+        {
+            "name": "main",
+            "protocol": "openai",
+            "model": "test-model",
+            "base_url": "https://api.example.com/v1",
+            "api_key": "secret",
+        }
+    )
+    captured_sessions = []
+
+    class FakeApp:
+        def __init__(self, session, **_kwargs):
+            captured_sessions.append(session)
+
+        async def run_async(self, *, mouse: bool) -> TranscriptSnapshot:
+            return TranscriptSnapshot()
+
+    class FakeProvider:
+        async def close(self) -> None:
+            pass
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "create_provider", lambda _profile: FakeProvider())
+    monkeypatch.setattr(cli, "MewCodeApp", FakeApp)
+    await cli.run_app(profile)
+    assert captured_sessions[0].context.project_root == tmp_path
