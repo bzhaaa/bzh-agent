@@ -1,795 +1,645 @@
-# MewCode 工具系统 Plan
+# MewCode Agent Loop Plan
 
 ## 架构概览
 
-保留现有 CLI、Textual TUI、ChatSession 和 Provider 分层，在它们之间加入供应商无关的工具领域层。注册中心只保存统一工具定义；OpenAI 与 Anthropic Provider 各自把定义和消息转换成原生 API 格式。
+采用独立 `AgentRunner` 方案。现有 Provider 和工具执行层继续负责协议与单工具行为，在它们之上增加流式收集、工具调度和循环控制三层。
 
 ```text
-CLI
- ├─ 固定 project_root = cwd.resolve()
- ├─ 创建六个 Tool → ToolRegistry → ToolExecutor
- ├─ 创建 Provider
- └─ 启动 MewCodeApp
-          │
-          │ stream_reply(user_input)
-          ▼
-      ChatSession
-       ├─ 第一次 Provider.stream()
-       │    ├─ 纯文本 → 完成并提交
-       │    └─ ToolCall → 单调用校验
-       │                    │
-       │                    ▼
-       │              ToolExecutor
-       │               ├─ JSON/Schema 校验
-       │               ├─ 命令确认回调 → TUI Modal
-       │               ├─ 超时与取消
-       │               └─ ToolResult
-       │                    │
-       └─ 回灌结果 → 第二次 Provider.stream()
-                    ├─ 最终文本 → 整轮原子提交
-                    └─ 再次 ToolCall → 限制状态，不执行、不提交
+CLI 组装
+ ├─ Provider
+ ├─ ToolRegistry / ToolExecutor
+ ├─ ToolScheduler
+ ├─ AgentRunner
+ ├─ ChatSession
+ └─ MewCodeApp
+        │
+        │ 用户输入、/plan、/do、取消
+        ▼
+   ChatSession
+    ├─ 保存历史与 Plan Mode 状态
+    ├─ 解析会话命令
+    ├─ 提供本轮历史检查点提交入口
+    └─ 创建 AgentRunRequest
+              │
+              ▼
+         AgentRunner
+          ├─ 控制 1..10 次迭代
+          ├─ 判断正常完成与停止条件
+          ├─ 维护本轮未知工具计数和 Token 累计
+          └─ 产生 AgentEvent
+              │
+      ┌───────┴────────┐
+      ▼                ▼
+StreamCollector    ToolScheduler
+ ├─ 消费 Provider 流  ├─ 按原顺序划分执行段
+ ├─ 实时转发增量      ├─ 读工具段并发
+ ├─ 收集完整响应      ├─ 副作用工具串行
+ └─ 验证正常结束      └─ 保持结果原始顺序
+      │                │
+      └───────┬────────┘
+              ▼
+        下一次模型请求
 ```
 
-工具系统划分为四层：
+各层职责：
 
-1. **领域模型层。** 定义 `ToolDefinition`、`ToolCall`、`ToolResult`、结构化会话消息和统一流事件，不依赖 SDK、Textual 或具体工具。
-2. **工具运行层。** `Tool` 接口描述单个工具；`ToolRegistry` 管理登记与查找；`ToolExecutor` 统一处理 JSON 解析、Pydantic Schema 校验、确认、超时、异常和结果序列化。
-3. **协议适配层。** 两个 Provider 将统一工具定义、结构化历史和工具结果转换为各自 API 请求，并把流式工具调用碎片组装成统一 `ToolCall`。工具调用只有在流正常结束后才向上层产出。
-4. **交互编排层。** `ChatSession` 负责“一次工具 + 一次最终答复”的事务状态机；TUI 只负责展示事件、弹出命令确认框和传回批准结果，不直接执行工具。
+1. **Provider 事件层。** OpenAI 与 Anthropic 继续解析各自流协议，但只产生供应商无关的底层事件，包括 thinking、文本、完整工具调用、Token 用量和正常结束。
+2. **StreamCollector。** 每次模型请求创建一个收集器。它把 thinking 和文本立即转换为 Agent 事件，同时收集完整文本、工具调用和 Token 用量；只有看到合法结束事件后才提供完整响应。
+3. **ToolScheduler。** 根据当前模式可用的工具集合执行一批调用。它只依赖工具注册中心、执行器和工具安全分类，不依赖 Provider、Session 或 TUI。
+4. **AgentRunner。** 实现 ReAct 状态机。它使用收集器请求模型，使用调度器执行工具，通过历史提交接口保存完整检查点，并把所有过程转换为统一 Agent 事件。
+5. **ChatSession。** 从现有“两次请求状态机”收缩为会话外观层，负责内存历史、Plan Mode 状态、`/plan`/`/do` 解析和检查点提交，不再包含工具循环细节。
+6. **MewCodeApp。** 只消费 Agent 事件并更新 transcript、工具记录、模式标识和进度，不再根据工具数量或 Provider 异常决定是否继续。
 
-现有纯文本路径保持快速路径：模型没有请求工具时，只调用一次 Provider，行为与当前版本一致。
+取消改为显式的本轮取消控制，而不是直接把 TUI Worker 当成业务取消机制：
 
-`ToolRegistry` 对外提供供应商无关的定义列表，真正的 OpenAI/Anthropic JSON 包装由各 Provider 完成，以同时满足注册中心集中管理和协议隔离要求。
+1. `Ctrl+C` 通知当前 Agent Run 取消。
+2. 收集器取消正在等待的 Provider 流。
+3. 调度器取消并回收所有未完成工具任务。
+4. 命令工具继续执行既有进程组终止逻辑。
+5. AgentRunner 产生 `cancelled` 停止事件后结束。
+6. 应用退出等强制取消路径仍保留底层任务取消作为兜底清理。
+
+历史通过 ChatSession 提供的检查点提交入口逐步保存。AgentRunner 不直接持有 UI，也不依赖历史具体存储方式，后续可以把内存历史替换为持久化实现。
 
 ## 核心数据结构
 
-### ToolDefinition
+### ProviderEvent
+
+现有 `StreamEvent` 拆成仅供 Provider 与收集器通信的 `ProviderEvent`，避免 TUI 直接消费协议层事件。
+
+```python
+class ProviderEventKind(StrEnum):
+    THINKING_DELTA = "thinking_delta"
+    TEXT_DELTA = "text_delta"
+    TOOL_CALL = "tool_call"
+    TOKEN_USAGE = "token_usage"
+    DONE = "done"
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderEvent:
+    kind: ProviderEventKind
+    delta: str = ""
+    tool_call: ToolCall | None = None
+    usage: TokenUsage | None = None
+```
+
+Provider 在正常流结束前最多产生一次归一化 Token 用量。未提供用量时不伪造事件，由收集器补成未知值。
+
+### TokenUsage
 
 ```python
 @dataclass(frozen=True, slots=True)
-class ToolDefinition:
-    name: str
-    description: str
-    input_schema: dict[str, object]
+class TokenUsage:
+    input_tokens: int | None
+    output_tokens: int | None
+
+    @property
+    def total_tokens(self) -> int | None: ...
+
+    def accumulate(self, other: TokenUsage) -> TokenUsage: ...
 ```
 
-名称使用小写 snake_case。Schema 为 JSON Schema object，必须关闭未知字段；注册时验证名称、描述和 Schema 基本结构。
+任一累计项曾经未知，则该累计项保持未知。只有输入和输出都已知时才计算总 Token。
 
-### ToolCall
+### AgentEvent
 
 ```python
-@dataclass(frozen=True, slots=True)
-class ToolCall:
-    id: str
-    name: str
-    arguments_json: str
-```
+class AgentMode(StrEnum):
+    NORMAL = "normal"
+    PLAN = "plan"
 
-保存供应商给出的稳定调用 ID 和完整原始 JSON。Provider 只负责安全拼接，不在协议层执行工具或修正参数。
 
-### ToolResult
-
-```python
-class ToolErrorCode(StrEnum):
-    UNKNOWN_TOOL = "unknown_tool"
-    INVALID_JSON = "invalid_json"
-    INVALID_ARGUMENTS = "invalid_arguments"
-    PATH_OUTSIDE_ROOT = "path_outside_root"
-    NOT_FOUND = "not_found"
-    NOT_A_FILE = "not_a_file"
-    INVALID_ENCODING = "invalid_encoding"
-    NO_UNIQUE_MATCH = "no_unique_match"
-    INVALID_PATTERN = "invalid_pattern"
-    PERMISSION_DENIED = "permission_denied"
-    USER_REJECTED = "user_rejected"
-    MULTIPLE_TOOLS = "multiple_tools"
-    TOOL_LIMIT_REACHED = "tool_limit_reached"
-    TIMEOUT = "timeout"
-    EXECUTION_FAILED = "execution_failed"
-    CANCELLED = "cancelled"
-    INTERNAL_ERROR = "internal_error"
-```
-
-```python
-@dataclass(frozen=True, slots=True)
-class ToolResult:
-    call_id: str
-    tool_name: str
-    success: bool
-    content: dict[str, object]
-    error_code: ToolErrorCode | None = None
-    error_message: str | None = None
-    truncated: bool = False
-
-    def to_model_json(self) -> str: ...
-```
-
-`to_model_json()` 使用稳定键序列化，既供 Provider 回灌，也供 TUI 从同一结果生成摘要。错误正文统一限长，不含 traceback。
-
-### ToolContext
-
-```python
-@dataclass(frozen=True, slots=True)
-class ToolContext:
-    project_root: Path
-    approval_handler: ApprovalHandler
-```
-
-```python
-@dataclass(frozen=True, slots=True)
-class CommandApprovalRequest:
-    command: str
-    cwd: str
-    timeout_seconds: float
-```
-
-```python
-ApprovalHandler = Callable[
-    [CommandApprovalRequest],
-    Awaitable[bool],
-]
-```
-
-执行器每次遇到需要确认的工具时调用一次 handler。测试可注入固定批准/拒绝函数；CLI 组装时使用一个可延迟绑定的 approval handler，`MewCodeApp` 启动后将其绑定到自身模态确认方法，工具层不依赖 Textual 类型。
-
-### Tool 接口
-
-```python
-class Tool(Protocol):
-    definition: ToolDefinition
-    argument_model: type[BaseModel]
-    requires_approval: bool
-
-    async def execute(
-        self,
-        arguments: BaseModel,
-        context: ToolContext,
-    ) -> dict[str, object]: ...
-```
-
-工具实现只处理已校验参数和领域操作。未知工具、JSON/Schema 错误、批准、超时和异常转换由 `ToolExecutor` 负责。
-
-### 结构化会话消息
-
-将现有只有 `role + content` 的 `ChatMessage` 扩展为可表达工具轮次的供应商无关联合类型：
-
-```python
-@dataclass(frozen=True, slots=True)
-class UserMessage:
-    content: str
-
-@dataclass(frozen=True, slots=True)
-class AssistantMessage:
-    content: str
-    tool_calls: tuple[ToolCall, ...] = ()
-
-@dataclass(frozen=True, slots=True)
-class ToolResultMessage:
-    result: ToolResult
-
-ChatMessage = UserMessage | AssistantMessage | ToolResultMessage
-```
-
-工具回合历史顺序固定为：
-
-```text
-UserMessage
-AssistantMessage(tool_calls=(...))
-ToolResultMessage
-AssistantMessage(content=最终答复)
-```
-
-第一阶段工具调用前产生的普通文本若存在，保存在工具调用对应的 `AssistantMessage.content` 中；thinking 仍只用于 UI，不写入历史。元组既能表示正常的单调用，也能在多工具限制场景中完整重放所有被拒绝的调用。
-
-### 统一流事件
-
-```python
-class StreamEventKind(StrEnum):
+class AgentEventKind(StrEnum):
+    MODE_CHANGED = "mode_changed"
+    ITERATION_STARTED = "iteration_started"
     THINKING_DELTA = "thinking_delta"
     TEXT_DELTA = "text_delta"
     TOOL_CALL = "tool_call"
     TOOL_RESULT = "tool_result"
-    LIMIT_REACHED = "limit_reached"
-    DONE = "done"
+    TOKEN_USAGE = "token_usage"
+    PROGRESS = "progress"
+    STOPPED = "stopped"
+
+
+class AgentStopReason(StrEnum):
+    COMPLETED = "completed"
+    ITERATION_LIMIT = "iteration_limit"
+    UNKNOWN_TOOL_LIMIT = "unknown_tool_limit"
+    CANCELLED = "cancelled"
+    PROVIDER_ERROR = "provider_error"
+    INVALID_STREAM = "invalid_stream"
+    NO_PLAN = "no_plan"
+    INVALID_COMMAND = "invalid_command"
 ```
 
 ```python
 @dataclass(frozen=True, slots=True)
-class StreamEvent:
-    kind: StreamEventKind
+class AgentProgress:
+    phase: Literal[
+        "requesting_model",
+        "executing_tools",
+        "checkpoint_committed",
+    ]
+    iteration: int
+    completed_tools: int = 0
+    total_tools: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class UsageSnapshot:
+    request: TokenUsage
+    cumulative: TokenUsage
+
+
+@dataclass(frozen=True, slots=True)
+class AgentEvent:
+    kind: AgentEventKind
+    iteration: int = 0
+    mode: AgentMode = AgentMode.NORMAL
     delta: str = ""
     tool_call: ToolCall | None = None
     tool_result: ToolResult | None = None
+    usage: UsageSnapshot | None = None
+    progress: AgentProgress | None = None
+    stop_reason: AgentStopReason | None = None
 ```
 
-Provider 只产生 `THINKING_DELTA`、`TEXT_DELTA`、`TOOL_CALL` 和 `DONE`；`ChatSession` 在执行后补充 `TOOL_RESULT`，在第二次工具请求时补充 `LIMIT_REACHED`。
+每次运行恰好产生一个最终 `STOPPED` 事件。Provider 错误和无效流先在 Agent 层转换为脱敏停止事件，TUI 不再捕获 Provider 异常来决定业务状态。
 
-### TranscriptEntry 扩展
+### CollectedResponse 与 StreamCollector
 
 ```python
-TranscriptRole = Literal["user", "assistant", "tool", "status"]
+@dataclass(frozen=True, slots=True)
+class CollectedResponse:
+    content: str
+    tool_calls: tuple[ToolCall, ...]
+    usage: TokenUsage
 
-@dataclass(slots=True)
-class TranscriptEntry:
-    role: TranscriptRole
-    content: str = ""
-    thinking: str = ""
-    state: Literal[
-        "streaming", "pending", "approved", "rejected",
-        "complete", "cancelled", "error"
-    ] = "complete"
-    tool_name: str | None = None
+
+class StreamCollector:
+    def __init__(
+        self,
+        *,
+        iteration: int,
+        mode: AgentMode,
+        control: AgentRunControl,
+    ) -> None: ...
+
+    async def consume(
+        self,
+        source: AsyncIterator[ProviderEvent],
+    ) -> AsyncIterator[AgentEvent]: ...
+
+    @property
+    def response(self) -> CollectedResponse: ...
 ```
 
-UI 只保存有界摘要，不将完整命令输出复制进 transcript；完整且已截断到模型上限的结果保存在会话消息中。
+`consume()` 实时转发 thinking 和文本事件，同时收集完整响应。只有消费到唯一合法的 `DONE` 后才能读取 `response`；提前结束、重复结束或字段冲突均产生无效流错误。
+
+### 工具执行策略与 ToolScheduler
+
+```python
+class ToolExecutionPolicy(StrEnum):
+    PARALLEL_READ = "parallel_read"
+    SERIAL_SIDE_EFFECT = "serial_side_effect"
+```
+
+工具策略固定为：
+
+- `read_file`、`find_files`、`search_code`：`PARALLEL_READ`
+- `write_file`、`edit_file`、`execute_command`：`SERIAL_SIDE_EFFECT`
+
+```python
+@dataclass(frozen=True, slots=True)
+class ToolSegmentResult:
+    calls: tuple[ToolCall, ...]
+    results: tuple[ToolResult, ...]
+
+
+class ToolScheduler:
+    async def execute(
+        self,
+        calls: Sequence[ToolCall],
+        context: ToolContext,
+        control: AgentRunControl,
+    ) -> AsyncIterator[ToolSegmentResult]: ...
+```
+
+调度器逐段产生结果：并发读段全部结束后按原顺序返回，副作用段每次只含一个调用。Plan Mode 使用只包含三个读工具的注册中心视图，因此未开放工具会得到 `UNKNOWN_TOOL`，不会绕过模式边界执行。
+
+### AgentRunControl
+
+```python
+class AgentRunControl:
+    def cancel(self) -> None: ...
+    def is_cancelled(self) -> bool: ...
+    async def wait_cancelled(self) -> None: ...
+```
+
+收集器和调度器同时等待当前工作与取消信号。取消发生时主动取消底层 Provider 读取或工具任务，完成清理后由 AgentRunner 产生停止事件。
+
+### AgentRunner 与历史提交
+
+```python
+class HistorySink(Protocol):
+    async def commit(
+        self,
+        messages: Sequence[ChatMessage],
+    ) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class AgentRunRequest:
+    history: tuple[ChatMessage, ...]
+    user_message: UserMessage
+    mode: AgentMode
+    max_iterations: int
+    control: AgentRunControl
+    history_sink: HistorySink
+
+
+class AgentRunner:
+    async def run(
+        self,
+        request: AgentRunRequest,
+    ) -> AsyncIterator[AgentEvent]: ...
+```
+
+Runner 只接收历史快照、规范化用户消息、当前模式、取消控制和历史提交接口。它不持有 TUI 或 ChatSession。
+
+### ChatSession
+
+```python
+class ChatSession:
+    @property
+    def history(self) -> tuple[ChatMessage, ...]: ...
+
+    @property
+    def mode(self) -> AgentMode: ...
+
+    async def stream_reply(
+        self,
+        user_input: str,
+    ) -> AsyncIterator[AgentEvent]: ...
+
+    def cancel_current(self) -> None: ...
+```
+
+ChatSession 保存当前模式、可执行计划状态、当前运行的取消控制和内存历史。`/plan <任务>`、Plan 模式后续消息和 `/do` 被转换成明确的模型指令文本；TUI transcript 仍展示用户原始输入。
 
 ## 模块设计
 
-### 路径安全模块
+### AgentRunner 循环
 
-职责：建立唯一的项目文件访问边界，供所有文件类工具复用。
+每次 `run()`：
 
-```python
-class ProjectPaths:
-    def __init__(self, root: Path) -> None: ...
-    def resolve_file(
-        self,
-        user_path: str,
-        *,
-        must_exist: bool,
-    ) -> Path: ...
+1. 初始化迭代计数、连续未知工具计数和累计 Token。
+2. 将历史快照与尚未提交的本轮用户消息组成请求上下文。
+3. 产生迭代开始和请求进度事件。
+4. 通过 Provider 与 StreamCollector 消费一次完整模型流。
+5. 产生本次及累计 Token 用量事件。
+6. 响应不含工具时，验证文字非空，提交用户消息和最终助手消息，产生 `STOPPED(COMPLETED)`。
+7. 响应包含工具时，先产生调用事件，再由当前模式的 ToolScheduler 执行。
+8. 收集全部结果并按调用顺序产生结果事件。
+9. 提交用户消息、助手工具请求和全部工具结果。
+10. 更新连续未知工具计数。
+11. 连续两次均只包含未知工具时停止。
+12. 第 10 次工具迭代完成后停止，不发起第 11 次请求。
+13. 其他情况使用已提交历史进入下一次迭代。
+
+Provider 错误和无效流由 Runner 转换成脱敏停止事件。普通工具失败不会停止循环。
+
+### 历史检查点
+
+一次工具检查点固定为：
+
+```text
+首次工具迭代：
+UserMessage
+AssistantMessage(text + tool_calls)
+ToolResultMessage × N
+
+后续工具迭代：
+AssistantMessage(text + tool_calls)
+ToolResultMessage × N
 ```
 
-规则：
+最终文字检查点为：
 
-- 启动时将根目录解析为规范绝对路径。
-- 工具参数统一使用相对项目根目录的路径。
-- 拒绝空路径、项目外绝对路径和包含越界语义的路径。
-- 对已有目标使用严格解析，检查最终路径是否仍在根目录内。
-- 对待创建路径，解析最近的已有父目录，拒绝通过父目录符号链接越界。
-- 不使用字符串前缀判断父子关系，而使用路径组成关系。
-- 工具输出只返回相对路径，不暴露无关的本机绝对路径。
+```text
+首次直接回答：
+UserMessage
+AssistantMessage(final_text)
 
-### 原子写入模块
-
-职责：为写文件和改文件提供同目录原子替换。
-
-```python
-def atomic_write_text(path: Path, content: str) -> None: ...
+工具循环后的最终回答：
+AssistantMessage(final_text)
 ```
 
-流程：
+工具批次必须获得每个调用的结果后才提交。
 
-1. 在目标目录创建临时文件。
-2. 以 UTF-8 写入并刷新缓冲区。
-3. 保留已有文件的权限位；新文件使用正常默认权限。
-4. 使用原子替换提交。
-5. 无论成功、失败或取消都清理未提交的临时文件。
+取消处理：
 
-该模块不提供备份和撤销。
+- 模型流中取消：当前响应不完整，直接丢弃，保留更早检查点。
+- 工具执行中取消：保留已完成结果，为正在执行或尚未启动的调用生成 `CANCELLED` 结果，提交合法完整工具检查点后停止。
+- 命令执行中取消：先终止进程组，再生成取消结果。
+- 应用退出等强制任务取消：完成资源清理后继续向上传播。
 
-### ToolRegistry
+### ToolScheduler 分段
+
+注册中心增加只读子集能力：
 
 ```python
 class ToolRegistry:
-    def __init__(self, tools: Iterable[Tool] = ()) -> None: ...
-    def register(self, tool: Tool) -> None: ...
-    def get(self, name: str) -> Tool | None: ...
-    def definitions(self) -> tuple[ToolDefinition, ...]: ...
+    def subset(self, names: Collection[str]) -> ToolRegistry: ...
 ```
 
-职责：
+CLI 从同一默认注册中心创建 Normal 六工具环境和 Plan 三个读工具环境。
 
-- 验证并登记工具。
-- 保持稳定的注册顺序。
-- 拒绝重复名称。
-- 暴露供应商无关的不可变工具定义。
-- 不负责生成任何供应商原生 API 字典。
-
-默认工厂创建并登记六个核心工具：
-
-```python
-def create_default_registry() -> ToolRegistry: ...
-```
-
-项目根目录只存在于 `ToolContext`，使同一组无状态工具定义可在不同临时项目中测试和复用。
-
-### ToolExecutor
-
-```python
-class ToolExecutor:
-    async def execute(
-        self,
-        call: ToolCall,
-        context: ToolContext,
-    ) -> ToolResult: ...
-```
-
-执行顺序：
-
-1. 按名称查找工具。
-2. 完整解析 `arguments_json`，根值必须是 object。
-3. 使用工具的 Pydantic 参数模型校验，拒绝未知字段。
-4. 将请求超时限制在工具允许的最大值内。
-5. 若工具需要确认，构造本次确认请求并等待 handler。
-6. 用户拒绝时直接返回 `USER_REJECTED`，不调用工具。
-7. 在 `asyncio.timeout()` 中执行工具。
-8. 将预期领域错误、超时和意外异常转换为统一结果。
-9. 对模型结果 JSON 和用户可见摘要分别执行长度限制。
-
-`CancelledError` 不转换为普通失败结果，而是在完成必要资源清理后继续向上传播，使 ChatSession 回滚本轮。
-
-除命令工具使用参数中的超时外，文件与搜索工具使用执行器定义的固定超时。所有文件参数、单文件读取和搜索扫描均有字节上限；文件操作使用短小的同步临界区，搜索每处理一批文件主动让出事件循环。第一版不把不可中止的文件写入委派到后台线程，避免超时后遗留仍在修改文件的线程。
-
-### ReadFileTool
-
-参数：
-
-```python
-class ReadFileArguments(BaseModel):
-    path: str
-    start_line: int = 1
-    line_count: int = 200
-```
-
-行为：
-
-- 只读取普通 UTF-8 文本文件。
-- 读取前检查文件大小上限，避免把无界文件载入内存。
-- 行号从 1 开始。
-- `line_count` 有最大值。
-- 返回相对路径、实际行区间、带行号文本、总行数和截断状态。
-- 空文件正常返回；起始行超过文件末尾属于无效范围。
-
-### WriteFileTool
-
-参数：
-
-```python
-class WriteFileArguments(BaseModel):
-    path: str
-    content: str
-```
-
-行为：
-
-- 自动创建项目内父目录。
-- `content` 有明确字节上限，超过时在写入前拒绝。
-- 使用原子写入。
-- 返回相对路径、操作类型 `created` 或 `overwritten`、写入字符数。
-- 目标若为目录或越界符号链接则失败。
-
-### EditFileTool
-
-参数：
-
-```python
-class EditFileArguments(BaseModel):
-    path: str
-    old_text: str
-    new_text: str
-```
-
-行为：
-
-- `old_text` 不得为空。
-- 目标文件及替换后内容均受文件字节上限约束。
-- 读取完整 UTF-8 文本并统计非重叠匹配次数。
-- 只有匹配次数恰好为 1 时执行一次替换并原子写回。
-- 零次或多次匹配时返回 `NO_UNIQUE_MATCH`，并携带实际匹配次数，文件保持不变。
-- 返回相对路径和替换前后字符数。
-
-### ExecuteCommandTool
-
-参数：
-
-```python
-class ExecuteCommandArguments(BaseModel):
-    command: str
-    timeout_seconds: float = 30
-```
-
-约束：
-
-- `command` 非空，长度有限制。
-- 超时下限 1 秒、默认 30 秒、最大 300 秒。
-- 使用系统 Shell 执行完整命令，工作目录固定为项目根目录。
-- 每次调用必须先经 `ApprovalHandler` 确认；确认内容与最终执行内容完全相同。
-- 同时读取 stdout 和 stderr，分别限制字节数并标注截断。
-- 正常退出和非零退出都属于“工具已成功执行”，`content` 中返回 `exit_code`；只有无法启动、超时等属于工具失败。
-- 创建独立进程组。取消或超时时先终止整个进程组，等待短暂宽限期，仍未退出则强制杀死，随后回收进程。
-- 第一版不解析或限制 Shell 命令内部访问的路径与网络。
-
-返回示例：
-
-```json
-{
-  "command": "uv run pytest -q",
-  "cwd": ".",
-  "exit_code": 0,
-  "stdout": "48 passed ...",
-  "stderr": "",
-  "stdout_truncated": false,
-  "stderr_truncated": false
-}
-```
-
-### FindFilesTool
-
-参数：
-
-```python
-class FindFilesArguments(BaseModel):
-    pattern: str
-    max_results: int = 200
-```
-
-行为：
-
-- pattern 使用相对根目录的 glob 语义，拒绝绝对和越界模式。
-- 遍历时跳过 `.git`，并不递归进入符号链接目录。
-- 只返回普通文件。
-- 每个候选结果再次走规范路径边界校验。
-- 返回相对 POSIX 路径，按字典序排序。
-- 达到上限后停止并标注 `truncated`。
-
-### SearchCodeTool
-
-参数：
-
-```python
-class SearchCodeArguments(BaseModel):
-    query: str
-    regex: bool = False
-    file_pattern: str = "**/*"
-    max_results: int = 200
-```
-
-行为：
-
-- 使用 Python 正则引擎；`regex=false` 时对 query 做字面量转义。
-- 复用安全文件枚举逻辑，不依赖系统安装的 `rg`。
-- 跳过 `.git`、符号链接目录、二进制和非 UTF-8 文件。
-- 按相对路径、行号稳定排序。
-- 返回 `path`、`line_number`、截断后的 `line`。
-- 非法正则返回 `INVALID_PATTERN`；零匹配是成功结果。
-- 达到匹配数上限或单行上限时分别标注截断。
-
-### Provider 公共接口
-
-```python
-class LLMProvider(Protocol):
-    def stream(
-        self,
-        messages: Sequence[ChatMessage],
-        tools: Sequence[ToolDefinition] = (),
-    ) -> AsyncIterator[StreamEvent]: ...
-```
-
-Provider 同时承担两个协议边界：
-
-1. 将统一 `ChatMessage` 联合类型转换成供应商原生消息。
-2. 将 `ToolDefinition` 包装成供应商原生工具定义。
-
-注册中心不提供 `to_openai()` 或 `to_anthropic()`，从而避免协议泄漏。
-
-### OpenAIProvider
-
-请求转换：
-
-- `UserMessage` 转为 `{"role": "user", "content": ...}`。
-- 普通 `AssistantMessage` 转为 assistant 文本消息。
-- 含调用的 `AssistantMessage` 将 `tool_calls` 元组完整转为原生 `tool_calls` 数组，参数使用保存的原始 JSON。
-- `ToolResultMessage` 转为 `{"role": "tool", "tool_call_id": ..., "content": result_json}`。
-- 工具定义转为 `{"type": "function", "function": {"name", "description", "parameters"}}`。
-- 有工具时设置 `tool_choice="auto"`。
-
-流解析：
-
-- 以 `choice.index` 校验只存在一个响应分支。
-- 按 `tool_call.index` 分组，首次片段记录 id、type 和 name，后续片段只允许补充一致字段。
-- 顺序追加 `function.arguments` 碎片。
-- `finish_reason="tool_calls"` 时要求至少一个完整调用；`finish_reason="stop"` 时要求有文本。
-- 流结束前不产出 `TOOL_CALL`，从而避免残缺调用被执行。
-- 同批多个调用全部保留并交由 ChatSession 产生单工具限制结果。
-
-### AnthropicProvider
-
-请求转换：
-
-- 连续的统一消息按 Anthropic `user` / `assistant` 角色构造内容块。
-- 助手工具调用将 `tool_calls` 元组完整转为同一 assistant 消息中的多个 `tool_use` block。
-- 工具结果使用下一条 `user` 消息中的 `tool_result` block，并设置 `is_error = not result.success`。
-- 工具定义使用 `{"name", "description", "input_schema"}`。
-
-流解析：
-
-- `content_block_start` 遇到 `tool_use` 时记录 block index、id、name；SDK 提供的初始 `input` 必须为空 object，参数正文统一来自后续 JSON delta。
-- `content_block_delta` 的 `input_json_delta.partial_json` 按 block index 拼接。
-- 文本与 thinking 仍按现有方式增量上送。
-- `content_block_stop` 封闭对应调用；`message_stop` 后统一验证。
-- 多个 `tool_use` block 全部保留给 ChatSession 做限制处理。
-- 缺 id/name、非空初始 input、重复 block index、结束前未封闭、JSON 无法完整解析或 stop reason 不一致均判为无效流。
-
-### ChatSession 工具回合状态机
-
-`ChatSession` 注入 Provider、ToolRegistry、ToolExecutor 和 ToolContext。公开入口仍为异步事件流：
-
-```python
-async def stream_reply(
-    self,
-    user_input: str,
-) -> AsyncIterator[StreamEvent]: ...
-```
-
-TUI 创建 Session 时把命令批准能力绑定到 `ToolContext` 的 handler，因此会话接口无需依赖 Textual 类型。
-
-状态流：
+分段算法按调用顺序单次扫描：
 
 ```text
-START
-  │
-  ├─ 第一次响应为纯文本 + DONE
-  │      └─ 原子提交 User + Assistant → COMPLETE
-  │
-  └─ 第一次响应包含 TOOL_CALL + DONE
-         ├─ 调用数 > 1
-         │    └─ 构造 MULTIPLE_TOOLS 结果，不执行
-         │
-         └─ 调用数 = 1
-                └─ ToolExecutor.execute()
-                       ├─ 成功
-                       ├─ 可恢复错误
-                       └─ 用户拒绝
-                              │
-                              ▼
-             yield TOOL_RESULT
-             构造候选历史：
-             User + Assistant(tool_calls) + ToolResult(s)
-                              │
-                              ▼
-                    第二次 Provider.stream()
-                       ├─ 纯文本 + DONE
-                       │    └─ 整轮原子提交 → COMPLETE
-                       └─ 再次 TOOL_CALL
-                            └─ yield LIMIT_REACHED
-                               不执行、不发第三次请求、不提交本轮
+连续 PARALLEL_READ → 一个并发段
+SERIAL_SIDE_EFFECT → 一个单调用串行段
+未知工具 → 一个立即失败的串行边界
 ```
-
-关键事务规则：
-
-- 第一次响应出现工具调用时，允许同时有前置文本，但不能把该文本提前提交。
-- 多工具限制也作为 `ToolResultMessage` 回灌一次，让模型有机会生成最终解释。由于供应商协议要求结果与调用 ID 对应，分别为每个被拒绝的调用生成 `MULTIPLE_TOOLS` 结果，所有结果内容一致且没有工具被执行。
-- 工具参数错误、未知工具、路径错误和用户拒绝都是可恢复结果，仍进入第二次模型请求。
-- Provider 无效流、第二次再次调用工具、取消或最终文本为空时，整个候选轮次不进入 `_history`。
-- 文件工具可能在最终答复失败前已完成副作用；UI 明确显示结果，但会话上下文仍回滚，且不自动撤销文件。
-- 纯文本路径保持现有事务规则及一次 Provider 调用。
-- Provider 接收的每次请求都带相同的工具定义，为后续 Agent Loop 保持契约稳定。
-
-### TUI 工具展示
-
-新增 `ToolMessage` widget，采用紧凑、非嵌套布局：
 
 ```text
-工具  read_file
-      src/mewcode/session.py
-      完成 · 读取 43 行
-
-工具  execute_command
-      uv run pytest -q
-      已拒绝
+read A ─┐
+read B ─┴─ 并发 → write C → read D ─┐
+                              grep E ─┴─ 并发 → edit F
 ```
 
-事件处理：
+并发段使用 `asyncio` 任务组。普通工具失败被收集为结果，不取消同组任务；外部取消则取消整个任务组。每段输出和最终批次结果都恢复为原调用顺序。
 
-- `TOOL_CALL`：在当前助手消息后插入 pending 工具记录。
-- `TOOL_RESULT`：更新对应记录为 complete/rejected/error，并显示有界摘要；多工具限制可更新多个 pending 记录。
-- `LIMIT_REACHED`：追加状态消息，并将当前助手消息标记为 error。
-- 第二次模型文本继续更新同一条 AssistantMessage，工具前的文本与最终文本之间保留清晰分隔，不创建重复的用户消息。
-- transcript 保存工具名、调用摘要和结果摘要，不保存未显示的完整输出。
+Plan Mode 中未开放的工具由只读注册中心视为未知工具，因此不会执行。
 
-### CommandApprovalScreen
+### StreamCollector
 
-```python
-class CommandApprovalScreen(ModalScreen[bool]):
-    BINDINGS = [
-        Binding("y", "approve"),
-        Binding("enter", "approve"),
-        Binding("n", "reject"),
-        Binding("escape", "reject"),
-    ]
+收集器维护文本片段、完整工具调用、本次 Token 用量和结束状态：
+
+- thinking/text：立即转发，文本同时加入缓冲。
+- tool call：保存完整调用并转发，但在 `DONE` 前不得执行。
+- usage：只接受一次并保存。
+- done：验证唯一性并关闭收集。
+- 提前结束、重复 done、缺少调用字段或结束原因冲突：拒绝生成完整响应。
+
+取消控制与 Provider 下一事件并行等待；取消优先时关闭异步流并回收等待任务。
+
+### Token 用量归一化
+
+OpenAI 请求启用流式 usage 返回：
+
+- `prompt_tokens` → 输入 Token。
+- `completion_tokens` → 输出 Token。
+
+Anthropic 从开始和结束事件收集：
+
+- 普通输入、cache creation 和 cache read Token 合并为输入 Token。
+- `output_tokens` → 输出 Token。
+
+Provider 没有返回 usage 时，收集器生成未知用量。累计过程中任何缺失项都会使对应累计项保持未知。
+
+### ChatSession 与 Plan Mode
+
+ChatSession 解析：
+
+- `/plan <任务>`：切换到 Plan，清除旧计划就绪状态，以只读规划指令包装任务后启动 Runner。
+- Plan Mode 中普通消息：保持 Plan，以“继续调查并更新计划”的指令包装补充内容。
+- `/do`：存在成功计划时切回 Normal、消费计划状态，并以“根据已完成计划开始执行”的指令启动 Runner。
+
+精确的空 `/plan` 和无计划 `/do` 不调用 Provider，只产生本地停止事件。`/do` 开始后保持 Normal，执行失败或取消不会自动回到 Plan。
+
+规划指令只写入模型历史，TUI transcript 显示用户原文。Plan Mode 中一次正常文字完成会把计划就绪状态设为真；失败或取消不会把未完成内容标记为计划。
+
+### TUI 消费
+
+- 每次迭代首次收到 thinking 或文本时创建该迭代的助手记录。
+- 工具调用按事件顺序追加在对应助手文本之后。
+- 工具结果通过调用 ID 更新对应记录。
+- 下一迭代创建新的助手记录，保持“说明 → 工具 → 新说明”的视觉顺序。
+- 模式、迭代、工具进度和累计 Token 显示在底部状态行。
+- `STOPPED` 决定最后记录是完成、取消还是错误，并按需追加状态消息。
+- `Ctrl+C` 先关闭命令确认框，再调用 `ChatSession.cancel_current()`，不直接取消正常业务 Worker。
+
+## 模块交互
+
+### 普通循环时序
+
+```text
+TUI              ChatSession        AgentRunner       Collector/Provider      Scheduler
+ │ submit(text)       │                  │                    │                   │
+ │───────────────────>│ create request   │                    │                   │
+ │                    │─────────────────>│ iteration 1        │                   │
+ │<──────────────────────────────────────│ ITERATION_STARTED  │                   │
+ │                    │                  │──── stream ────────>│                   │
+ │<──────────────────────────────────────── text/thinking ───│                   │
+ │<──────────────────────────────────────── TOOL_CALL ───────│                   │
+ │<──────────────────────────────────────│ TOKEN_USAGE        │                   │
+ │                    │                  │───────────────────────────────────────>│
+ │<──────────────────────────────────────────────────── TOOL_RESULT / PROGRESS ─│
+ │                    │<─────────────────│ commit checkpoint  │                   │
+ │<──────────────────────────────────────│ CHECKPOINT_COMMITTED                  │
+ │                    │                  │ iteration 2        │                   │
+ │                    │                  │──── stream ────────>│                   │
+ │<──────────────────────────────────────── final text ──────│                   │
+ │                    │<─────────────────│ commit final       │                   │
+ │<──────────────────────────────────────│ STOPPED(COMPLETED) │                   │
 ```
 
-模态框展示：
+单次工具迭代事件顺序：
 
-- 标题“允许执行命令？”
-- 完整命令，使用可滚动文本区，禁止编辑。
-- 工作目录显示为项目根目录。
-- 超时秒数。
-- 明确的“执行”和“拒绝”按钮及键盘行为。
+```text
+ITERATION_STARTED
+PROGRESS(requesting_model)
+THINKING_DELTA / TEXT_DELTA
+TOOL_CALL
+TOKEN_USAGE
+PROGRESS(executing_tools)
+TOOL_RESULT
+PROGRESS(checkpoint_committed)
+```
 
-App 通过 `push_screen_wait()` 返回一次性布尔结果。模态期间 composer 草稿不变；关闭后焦点恢复输入框。确认请求被用户拒绝时返回 false，但整个 reply worker 被 `Ctrl+C` 取消时仍向上传播取消。
+最终文字迭代不产生工具事件，提交最终助手消息后产生 `STOPPED(COMPLETED)`。
 
-### 取消路径
+### Plan Mode 时序
 
-- 模型流阶段：取消 reply worker，Provider 流在 `finally` 中关闭。
-- 等待确认阶段：关闭模态框并取消本轮，不启动命令。
-- 命令运行阶段：取消传递到工具，工具终止并回收整个进程组后重新抛出。
-- 文件工具阶段：在线程或协程取消点前完成的原子替换不回滚。
-- 所有取消路径都把 UI 工具记录标成 cancelled，并恢复 composer 与提交能力。
+```text
+/plan 任务
+  → MODE_CHANGED(PLAN)
+  → 只读 Agent Loop
+  → STOPPED(COMPLETED)，plan_ready = true
+  → 普通补充仍在 Plan 中更新计划
+  → /do
+  → MODE_CHANGED(NORMAL)，消费 plan_ready
+  → 全工具 Agent Loop
+  → STOPPED(...)
+```
+
+新的 `/plan <任务>` 覆盖待执行计划状态，但不删除已有历史。无计划 `/do` 和空 `/plan` 只产生本地状态，不创建模型消息或 Token 用量。
+
+### 停止状态机
+
+| 停止原因 | 触发点 | 当前内容处理 | 历史处理 | 后续请求 |
+|---|---|---|---|---|
+| `COMPLETED` | 完整响应不含工具且文本非空 | 展示最终文字 | 提交最终消息 | 不再请求 |
+| `ITERATION_LIMIT` | 第 10 次工具批次完成 | 展示上限状态 | 提交第 10 次工具检查点 | 禁止第 11 次 |
+| `UNKNOWN_TOOL_LIMIT` | 连续第二轮只含未知工具 | 展示停止状态 | 提交第二轮错误结果检查点 | 不再请求 |
+| `CANCELLED` | 用户取消 | 清理当前流或工具任务 | 保留旧检查点；工具阶段补齐取消结果 | 不再请求 |
+| `PROVIDER_ERROR` | 认证、限流、连接或服务错误 | 展示脱敏错误 | 丢弃未完成响应 | 不重试 |
+| `INVALID_STREAM` | 流提前结束、冲突或残缺 | 展示流错误 | 丢弃未完成响应，工具不执行 | 不重试 |
+| `NO_PLAN` | 无成功计划时输入 `/do` | 显示本地提示 | 不改变历史 | 不请求 |
+| `INVALID_COMMAND` | `/plan` 缺少任务 | 显示本地提示 | 不改变历史 | 不请求 |
+
+每个模型请求即使失败，也产生一次 Token 用量事件；Provider 未提供的字段标记为未知。停止事件始终位于本次运行事件流末尾。
+
+### 未知工具计数
+
+- 所有调用都不在当前注册中心：计数加一。
+- 至少一个调用有效：计数清零。
+- 未知调用分别获得 `UNKNOWN_TOOL` 结果。
+- 有效调用照常执行。
+- Plan Mode 中未开放工具按未知调用处理。
+- 第二次纯未知调用的错误结果先进入历史，随后停止。
+
+### 取消竞争
+
+1. 已得到完整 Provider `DONE` 的响应按完整响应处理。
+2. 已返回 `ToolResult` 的工具保留实际结果。
+3. 尚未返回结果的工具标记为 `CANCELLED`。
+4. 尚未启动的后续执行段不启动并生成取消结果。
+5. 取消后不启动新 Provider 请求。
+6. 每次运行只产生一个 `STOPPED(CANCELLED)`。
+
+外层任务被应用强制取消时优先完成资源清理；消费者已经终止时不保证投递最终事件。
 
 ## 文件组织
 
 ```text
 src/mewcode/
-├── cli.py
-├── models.py
-├── errors.py
-├── session.py
-├── tui.py
+├── agent/
+│   ├── __init__.py      # Agent 公共入口
+│   ├── control.py       # 显式取消信号
+│   ├── events.py        # Agent 事件、模式、进度和停止原因
+│   ├── collector.py     # Provider 流双路收集
+│   ├── scheduler.py     # 工具分段与并发调度
+│   └── runner.py        # ReAct 循环状态机
+├── models.py            # 会话消息、ProviderEvent、TokenUsage
+├── session.py           # 历史、Plan Mode 和命令解析
+├── cli.py               # 运行环境组装
+├── tui.py               # AgentEvent 展示
 ├── providers/
 │   ├── base.py
 │   ├── openai.py
 │   └── anthropic.py
 └── tools/
-    ├── __init__.py
-    ├── base.py          # Tool、ToolDefinition、ToolContext、ToolResult
-    ├── errors.py        # ToolError、ToolErrorCode
-    ├── paths.py         # ProjectPaths、原子 UTF-8 写入
-    ├── registry.py      # ToolRegistry、默认注册工厂
-    ├── executor.py      # 参数校验、确认、超时、错误转换
+    ├── base.py
+    ├── registry.py
     ├── read_file.py
+    ├── find_files.py
+    ├── search_code.py
     ├── write_file.py
     ├── edit_file.py
-    ├── execute_command.py
-    ├── find_files.py
-    └── search_code.py
-
-tests/
-├── tools/
-│   ├── test_paths.py
-│   ├── test_file_tools.py
-│   ├── test_search_tools.py
-│   ├── test_execute_command.py
-│   └── test_executor.py
-├── providers/
-│   ├── test_openai.py
-│   └── test_anthropic.py
-├── test_session.py
-├── test_tui.py
-└── test_cli.py
-
-docs/features/
-├── 000-current-features.md
-└── 001-tool-system.md
+    └── execute_command.py
 ```
 
-`models.py` 保存跨 Provider 的消息和流事件；工具领域模型集中在 `tools/base.py`，避免 `models.py` 变成所有业务类型的集合。
-
-## 模块交互
-
-依赖方向保持单向：
+模块依赖：
 
 ```text
-CLI → TUI / Session / Provider / Tools
-TUI → Session / Models / Tool approval types
-Session → Provider protocol / Models / ToolRegistry / ToolExecutor
-Provider implementations → Provider protocol / Models / ToolDefinition
-ToolExecutor → ToolRegistry / ToolContext / Tool errors
-Core tools → Tool protocol / ProjectPaths
-ProjectPaths → Python standard library
+events/control
+      ↑
+collector   tools
+      ↑       ↑
+      runner ← scheduler
+         ↑
+       session
+         ↑
+         tui
 ```
 
-Provider 不依赖 Session 或 TUI；工具不依赖 Provider、Session 或 TUI；Session 不依赖任何供应商 SDK；TUI 不解析工具 JSON 或执行工具。
+### 自动化测试
 
-## 测试设计
+```text
+tests/agent/
+├── test_collector.py
+├── test_scheduler.py
+└── test_runner.py
 
-### 工具与安全单元测试
+tests/test_session.py
+tests/test_tui.py
+tests/test_cli.py
+tests/tools/test_executor.py
+tests/providers/test_openai.py
+tests/providers/test_anthropic.py
+tests/e2e/mock_llm_server.py
+```
 
-- 临时项目目录验证普通路径、`..`、项目外绝对路径、文件符号链接和父目录符号链接。
-- 读文件覆盖行范围、空文件、截断、目录、二进制和无效 UTF-8。
-- 写文件覆盖父目录创建、新建、覆盖、权限保留和临时文件清理。
-- 改文件覆盖唯一、零次、多次匹配及失败时字节不变。
-- 查找文件覆盖 glob、排序、数量上限、`.git` 和符号链接跳过。
-- 搜索覆盖字面量、正则、glob、非法正则、长行、二进制、非 UTF-8 和结果上限。
-- 命令覆盖批准、拒绝、成功、非零退出、stdout/stderr 截断、启动失败、超时、取消和子进程回收。
+- collector：双路转发、完整收集、无效流、取消。
+- scheduler：分段、并发时序、结果顺序、普通失败、取消补齐。
+- runner：循环、停止条件、Token 累计、检查点。
+- session：Plan Mode 命令和历史状态。
+- TUI：多迭代显示、模式状态、进度、取消和确认。
+- Provider：多工具流和 Token usage。
+- E2E：确定性多步任务、Plan/Do、并发与停止场景。
 
-### 注册与执行器测试
+### 验收与总结文档
 
-- 六个默认工具定义完整且 Schema 关闭未知字段。
-- 重复名称和无效定义在注册时失败。
-- 未知工具、无效 JSON、非 object JSON、缺字段、未知字段和类型错误映射到稳定错误码。
-- approval handler 每次调用一次，拒绝时工具 execute 从未运行。
-- 普通异常脱敏，`CancelledError` 保持取消语义。
+```text
+spec.md
+plan.md
+task.md
+checklist.md
+docs/features/002-agent-loop.md
+docs/features/002-claude-code-agent-loop.md
+docs/features/README.md
+```
 
-### Provider 协议测试
-
-OpenAI：
-
-- 断言统一消息历史和工具定义转换为正确 Chat Completions 请求。
-- 用官方 SDK 解析本地 SSE，覆盖分段 id/name/arguments、前置文本和 stop。
-- 覆盖多 tool call index、字段冲突、残缺 JSON、错误 finish reason 和异常结束。
-
-Anthropic：
-
-- 断言统一历史转换成 `tool_use` / `tool_result` 内容块。
-- 用官方 SDK 解析本地 SSE，覆盖 `content_block_start`、多段 `partial_json`、block stop 和 message stop。
-- 覆盖多 block、重复 index、缺字段、残缺 JSON、未封闭 block 和异常结束。
-
-### 会话与 TUI 测试
-
-- 纯文本路径只调用 Provider 一次并保持旧历史形态。
-- 成功工具回合恰好调用两次 Provider，并原子提交四条结构化消息。
-- 工具错误、拒绝和多工具限制均回灌一次并允许最终文字答复。
-- 第二次工具调用不执行、不发第三次请求且不提交半轮。
-- 取消发生在首次流、确认、工具执行和第二次流时均回滚历史。
-- Textual Pilot 验证工具记录更新、模态键盘操作、草稿保持、滚动跟随、Ctrl+C 和静态记录。
-- 现有 48 项回归测试全部适配并继续通过。
-
-### tmux 端到端验收
-
-使用独立临时项目目录，避免修改 MewCode 源码。启动本地、确定性的 OpenAI 和 Anthropic SSE 测试服务，分别用真实 SDK 协议驱动以下对话：
-
-1. 请求读取测试文件，观察工具请求、结果和最终答复。
-2. 请求新建并唯一替换文件，退出后核对磁盘内容。
-3. 请求查找文件和搜索内容，观察相对路径与行号。
-4. 请求执行命令，分别用键盘批准和拒绝，确认只有批准分支产生副作用。
-5. 请求多个工具和第二次工具，确认均不执行。
-6. 生成或命令运行中按 `Ctrl+C`，确认恢复就绪且无残留进程。
-7. 退出后检查静态 transcript，并逐项更新 checklist。
-
-可用外部 API 时追加真实模型工具选择测试，但本地双协议端到端是完成条件，避免验收受第三方认证状态阻塞。
+`checklist.md` 在开发前生成，验收时记录实际结果。两份 002 文档只在功能验收完成后填写测试证据。
 
 ## 技术决策
 
 | 决策点 | 选择 | 理由 |
 |---|---|---|
-| 工具参数验证 | 每工具 Pydantic 模型 | 已有依赖，可生成 JSON Schema，并统一拒绝未知字段 |
-| 路径边界 | 解析后的 `Path` 组成关系 | 能防止字符串前缀、`..` 和符号链接绕过 |
-| 文件提交 | 同目录临时文件 + 原子替换 | 避免部分写入，同时保持实现聚焦 |
-| 内容搜索 | Python 文件遍历与正则 | 不产生未经确认的子进程，跨环境行为一致 |
-| 命令执行 | 异步 Shell + 独立进程组 | 支持完整命令、并发读取输出、超时和整组终止 |
-| 命令权限 | 每次 TUI 模态确认 | 符合用户选择，批准不跨调用复用 |
-| 工具调用产出 | 流结束后统一 `TOOL_CALL` | 残缺或冲突碎片不会提前触发副作用 |
-| 会话历史 | 供应商无关联合消息 | 可完整重放工具回合，并保持协议隔离 |
-| 工具回合 | 最多两次 Provider 请求 | 满足本章单工具边界，为下一章 Agent Loop 留扩展点 |
-| 事务提交 | 最终文字答复后整轮提交 | 后续请求不会看到半轮协议消息 |
-| UI 展示 | transcript 仅存有界摘要 | 静态记录可读且不复制大量工具输出 |
-| 输出限制 | 字节、行数、结果数多重上限 | 控制模型上下文、内存和终端布局风险 |
+| 循环归属 | 独立 `AgentRunner` | 避免 ChatSession 同时承担历史、循环、并发和 UI 状态 |
+| 事件边界 | ProviderEvent 与 AgentEvent 分离 | Provider 只表达模型流，TUI 只理解完整 Agent 行为 |
+| 事件传输 | 异步生成器，不增加 Queue | 天然支持背压和异常传播，无需 Actor 生命周期 |
+| 流收集 | 每次请求一个有状态 Collector | 实时转发与完整响应收集共存 |
+| 取消 | 显式取消控制，任务取消兜底 | 能投递停止事件并统一取消 Provider 与工具 |
+| 工具安全性 | 工具声明固定执行策略 | 不根据模型参数猜测副作用 |
+| 多工具调度 | 连续读段并发，副作用串行 | 保留模型顺序并获得安全并发 |
+| 并发实现 | `asyncio` 任务组并跟踪任务结果 | 取消时可回收并补齐取消结果 |
+| 结果顺序 | 始终等于调用顺序 | 保证双 Provider 历史确定 |
+| 历史粒度 | 完整工具批次为检查点 | 每个助手工具调用都有对应结果 |
+| 迭代上限 | 默认 10，内部可注入 | 满足安全兜底，不改 YAML |
+| 未知工具 | 连续两轮纯未知后停止 | 允许一次自我纠正，避免无效循环 |
+| Plan 边界 | 独立只读注册中心视图 | 未开放工具无法调度 |
+| Plan 指令 | 包装为模型可见用户指令 | 不扩展两种 Provider 的 system message 契约 |
+| `/do` | 消费最近成功计划并切回 Normal | 防止重复执行，模式明确 |
+| Token 累计 | 缺失值向累计传播 | 不把部分统计伪装成准确总量 |
+| 错误处理 | 可预期停止转换为事件 | TUI 不承担循环决策 |
+| Provider 重试 | 不自动重试 | 避免重复副作用并遵守 Spec |
+| TUI 记录 | 每次模型迭代独立记录 | 保持文本、工具和调整的真实顺序 |
+| 文档证据 | 自动化 + tmux 后填写 002 | 只记录实际验收结果 |
 
-## 设计自检
+## 关键权衡
 
-### Spec 覆盖
+- 慢事件消费者会降低 Provider 流读取速度，但避免无界事件缓冲。
+- Plan 指令进入模型历史会使模型看到的文本与 TUI 原始命令不同，但保持协议简单。
+- 工具执行中取消会补齐取消结果，因此历史比整批丢弃更完整；副作用仍不回滚。
+- 只读注册中心是模式能力范围，不扩展成通用权限系统。
+- 兼容端点不返回 usage 时显示未知，不做 tokenizer 估算。
 
-| Spec 需求 | 设计归属 |
+## Spec 覆盖
+
+| Spec 范围 | 设计归属 |
 |---|---|
-| F1-F2 | Tool 接口、ToolDefinition、ToolRegistry |
-| F3-F4 | ToolContext、ProjectPaths |
-| F5 | ReadFileTool、ProjectPaths、文件大小与行数上限 |
-| F6 | WriteFileTool、父目录创建、原子写入 |
-| F7 | EditFileTool、唯一匹配、原子写入 |
-| F8-F9 | ExecuteCommandTool、ApprovalHandler、CommandApprovalScreen |
-| F10-F11 | FindFilesTool、SearchCodeTool |
-| F12-F13 | ToolExecutor、ToolResult、ToolErrorCode |
-| F14 | TranscriptEntry、ToolMessage、静态 transcript |
-| F15-F16 | OpenAIProvider、AnthropicProvider 流解析 |
-| F17 | ChatSession 多工具校验、`tool_calls` 元组、MULTIPLE_TOOLS 结果 |
-| F18 | ChatSession 两阶段状态机、工具结果回灌 |
-| F19 | 第二次调用限制、LIMIT_REACHED、禁止第三次请求 |
-| F20-F21 | 结构化历史、事务提交、取消路径 |
-| F22 | 统一领域模型、双 Provider 契约与共享场景测试 |
+| F1-F6：循环与停止 | AgentRunner、AgentRunControl、停止状态机 |
+| F7-F9：事件与双路收集 | ProviderEvent、AgentEvent、StreamCollector |
+| F10-F13：多工具与确认 | ToolExecutionPolicy、ToolScheduler、ToolExecutor |
+| F14-F18：Plan Mode | ChatSession、只读注册中心、模式事件 |
+| F19：Token 用量 | 双 Provider、TokenUsage、AgentRunner 累计 |
+| F20-F23：历史与快速路径 | HistorySink、检查点算法、AgentRunner |
+| F24：双 Provider 一致性 | Provider 适配测试与共享领域场景 |
+| N1-N16 | 单向依赖、有界异步执行、兼容测试、tmux 验收和双文档流程 |
 
-### 接口完整性
-
-- Tool、Registry、Executor、Provider 与 Session 的输入输出均已定义。
-- 六个工具的参数、主要结果和错误语义均已定义。
-- 命令确认从工具层到 TUI 的异步回调契约已定义。
-- Provider 请求转换、流完成条件和历史重放格式已定义。
-
-### 依赖与矛盾检查
-
-- 依赖从 CLI/TUI/Session 指向领域和工具层，不存在工具反向依赖 UI 或 Provider 的环。
-- 注册中心保持供应商无关，Provider 负责原生字典，符合协议隔离要求。
-- 命令逐次确认但 Shell 本身不受路径沙箱限制，与 spec 的安全声明一致。
-- 一个工具调用后仅允许一次最终模型请求；多调用全部拒绝；不存在隐式 Agent Loop。
-- 文件副作用不随会话回滚，与 spec 的“不实现撤销”边界一致。
+技术设计没有未归属的 Spec 需求，模块依赖保持单向，Provider、调度器和 TUI 之间不存在循环依赖。

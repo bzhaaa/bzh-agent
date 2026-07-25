@@ -1,5 +1,7 @@
 # MewCode 工具系统功能总结
 
+Claude Code 对应能力的公开实现对照见 [001-claude-code-tool-system.md](001-claude-code-tool-system.md)。
+
 ## 本章目标
 
 本章把 MewCode 从纯对话助手扩展为可以在单个用户回合中调用一次本地工具的 Coding Agent。模型可以读取、创建和修改项目文件，查找文件、搜索内容，并在用户逐次确认后执行 Shell 命令；工具结果会回灌给模型，由模型生成最终文字答复。

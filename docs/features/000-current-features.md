@@ -5,6 +5,8 @@
 > 基线提交：`b5a40bf9b4658392d71b0e504d8cacd416910f97`  
 > 总结日期：2026-07-24
 
+Claude Code 对应能力的公开实现对照见 [000-claude-code-current-features.md](000-claude-code-current-features.md)。
+
 ## 1. 当前定位
 
 MewCode 是一个使用 Python 3.11+ 实现的终端 AI 助手。目前完成的是“纯对话 MVP”：用户可以在全屏终端界面中与大模型进行流式、多轮对话，但尚不具备工具调用、文件读取、代码编辑或 Shell 执行等 Coding Agent 能力。
@@ -171,12 +173,11 @@ uv run mewcode --help
 
 ## 10. 后续总结文档约定
 
-后续每完成一部分独立功能，在 `docs/features/` 下新增一份编号递增的总结文档，不覆盖历史文档。建议命名格式：
+后续每完成一部分独立功能，在 `docs/features/` 下新增同编号的两份文档，不覆盖历史文档：一份总结 MewCode 实现，另一份记录 Claude Code 对应能力的公开实现方式。命名格式：
 
 ```text
-001-功能名称.md
-002-功能名称.md
-003-功能名称.md
+NNN-功能名称.md
+NNN-claude-code-功能名称.md
 ```
 
-每份文档至少记录：功能目标、用户可见行为、架构与关键文件、配置或快捷键、测试与 tmux 验收证据、限制与后续边界，以及对应提交哈希。
+详细规则与当前配对目录见 [README.md](README.md)。
