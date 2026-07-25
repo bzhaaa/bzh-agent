@@ -14,6 +14,7 @@
 - **E8（命令与取消）：** 批准后 `approved-marker` 存在，拒绝后 `rejected-marker` 不存在；确认框中 Ctrl+C 后 `confirmation-cancelled-marker` 不存在；运行中取消后父 PID 20047、子 PID 20048 均已消失。
 - **E9（协议请求）：** 本地服务日志共 52 次请求（OpenAI 39、Anthropic 13）；成功工具回合均为两次请求，多工具仍只追加一次最终请求，连续调用没有第三次请求。
 - **E10（静态记录）：** 两个 tmux 会话退出后 `capture-pane` 均保留工具名、complete/rejected/error/cancelled 状态及有界摘要，不含配置 API Key、traceback 或完整隐藏输出。
+- **E11（功能总结）：** 新增 `docs/features/001-tool-system.md`，记录实现提交 `33e1c05`、架构、安全边界、配置兼容性、97 项自动化和 tmux 实测证据；`000-current-features.md` 保持原样。
 
 ## 工具契约与执行入口
 
@@ -116,11 +117,11 @@
 
 ## 功能总结
 
-- [ ] **C55：本章总结文档可追溯。**（验证：检查 `docs/features/001-tool-system.md`，期望记录六工具、架构、安全边界、配置、实际自动化/tmux 证据、已知限制和对应提交，且 `000-current-features.md` 未被覆盖）
+- [x] **C55：本章总结文档可追溯。**（验证：检查 `docs/features/001-tool-system.md`，期望记录六工具、架构、安全边界、配置、实际自动化/tmux 证据、已知限制和对应提交，且 `000-current-features.md` 未被覆盖；实际证据：E11）
 
 ## 完成条件
 
-- [ ] **C56：工具系统验收完成。**（验证：C1-C55 均有实际证据；若存在未通过项，本项保持未勾选并记录预期、实际与后续处理）
+- [x] **C56：工具系统验收完成。**（验证：C1-C55 均有实际证据；实际结果：56/56 通过，无未通过项）
 
 ## Spec 覆盖自检
 
