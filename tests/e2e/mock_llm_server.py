@@ -307,6 +307,7 @@ def anthropic_sse(
     prompt: str,
     step: int,
     mode: str,
+    thinking: bool = False,
 ) -> str:
     events: list[tuple[str, dict[str, object]]] = [
         (
@@ -331,6 +332,30 @@ def anthropic_sse(
             },
         )
     ]
+    content_index = 0
+    if thinking:
+        events.extend(
+            [
+                (
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": content_index,
+                        "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+                    },
+                ),
+                (
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": content_index,
+                        "delta": {"type": "thinking_delta", "thinking": "正在分析。"},
+                    },
+                ),
+                ("content_block_stop", {"type": "content_block_stop", "index": content_index}),
+            ]
+        )
+        content_index += 1
     if final and not calls:
         events.extend(
             [
@@ -338,7 +363,7 @@ def anthropic_sse(
                     "content_block_start",
                     {
                         "type": "content_block_start",
-                        "index": 0,
+                        "index": content_index,
                         "content_block": {"type": "text", "text": "", "citations": None},
                     },
                 ),
@@ -346,16 +371,16 @@ def anthropic_sse(
                     "content_block_delta",
                     {
                         "type": "content_block_delta",
-                        "index": 0,
+                        "index": content_index,
                         "delta": {"type": "text_delta", "text": final_text(prompt, mode)},
                     },
                 ),
-                ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+                ("content_block_stop", {"type": "content_block_stop", "index": content_index}),
             ]
         )
         stop_reason = "end_turn"
     elif calls:
-        for index, (name, arguments) in enumerate(calls):
+        for index, (name, arguments) in enumerate(calls, start=content_index):
             encoded = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
             split = max(1, len(encoded) // 2)
             events.extend(
@@ -367,7 +392,7 @@ def anthropic_sse(
                             "index": index,
                             "content_block": {
                                 "type": "tool_use",
-                                "id": f"tool-{step + 1}-{index + 1}",
+                                "id": f"tool-{step + 1}-{index - content_index + 1}",
                                 "name": name,
                                 "input": {},
                             },
@@ -400,7 +425,7 @@ def anthropic_sse(
                     "content_block_start",
                     {
                         "type": "content_block_start",
-                        "index": 0,
+                        "index": content_index,
                         "content_block": {"type": "text", "text": "", "citations": None},
                     },
                 ),
@@ -408,11 +433,11 @@ def anthropic_sse(
                     "content_block_delta",
                     {
                         "type": "content_block_delta",
-                        "index": 0,
+                        "index": content_index,
                         "delta": {"type": "text_delta", "text": "你好，MewCode 已就绪。"},
                     },
                 ),
-                ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+                ("content_block_stop", {"type": "content_block_stop", "index": content_index}),
             ]
         )
         stop_reason = "end_turn"
@@ -483,6 +508,7 @@ class Handler(BaseHTTPRequestHandler):
                         "system_block_count": len(system_blocks),
                         "reminder_present": bool(reminder),
                         "mode": mode,
+                        "thinking": bool(body.get("thinking")),
                         "system_cache_control": (
                             body.get("system", [{}])[0].get("cache_control")
                             if protocol == "anthropic" and body.get("system")
@@ -514,7 +540,14 @@ class Handler(BaseHTTPRequestHandler):
             payload = (
                 openai_sse(calls, final, prompt=prompt, step=step, mode=mode)
                 if protocol == "openai"
-                else anthropic_sse(calls, final, prompt=prompt, step=step, mode=mode)
+                else anthropic_sse(
+                    calls,
+                    final,
+                    prompt=prompt,
+                    step=step,
+                    mode=mode,
+                    thinking=bool(body.get("thinking")),
+                )
             )
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
