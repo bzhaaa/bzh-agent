@@ -29,7 +29,7 @@ class SearchCodeTool:
     policy = ToolExecutionPolicy.PARALLEL_READ
     definition = ToolDefinition(
         "search_code",
-        "在项目文本文件中搜索字面量或正则，支持 glob 过滤。",
+        "在项目文本文件中搜索字面量或正则，支持 glob 过滤。搜索内容时优先使用此工具，不要用 Shell 的 grep 或 rg 代替。",
         SearchCodeArguments.model_json_schema(),
     )
 

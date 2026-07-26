@@ -27,7 +27,7 @@ class FindFilesTool:
     policy = ToolExecutionPolicy.PARALLEL_READ
     definition = ToolDefinition(
         "find_files",
-        "按相对 glob 模式查找项目内普通文件。",
+        "按相对 glob 模式查找项目内普通文件。查找路径时优先使用此工具，不要用 Shell 的 find 或 ls 代替。",
         FindFilesArguments.model_json_schema(),
     )
 

@@ -112,3 +112,16 @@ def test_registry_rejects_missing_policy_and_subset_unknown() -> None:
         ToolRegistry((MissingPolicy(),))  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="不存在"):
         create_default_registry().subset(("read_file", "missing"))
+
+
+def test_tool_descriptions_reinforce_specialized_tool_rules() -> None:
+    descriptions = {
+        definition.name: definition.description
+        for definition in create_default_registry().definitions()
+    }
+    assert "编辑或覆盖已有文件前必须先" in descriptions["read_file"]
+    assert "小范围变化优先" in descriptions["write_file"]
+    assert "先用 read_file" in descriptions["edit_file"]
+    assert "find 或 ls" in descriptions["find_files"]
+    assert "grep 或 rg" in descriptions["search_code"]
+    assert "不得替代专用工具" in descriptions["execute_command"]

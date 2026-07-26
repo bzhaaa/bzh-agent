@@ -23,7 +23,7 @@ class ReadFileTool:
     policy = ToolExecutionPolicy.PARALLEL_READ
     definition = ToolDefinition(
         "read_file",
-        "读取项目内 UTF-8 文本文件的指定行。",
+        "读取项目内 UTF-8 文本文件的指定行。编辑或覆盖已有文件前必须先用此工具读取当前精确内容。",
         ReadFileArguments.model_json_schema(),
     )
 

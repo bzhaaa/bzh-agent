@@ -10,6 +10,13 @@ if TYPE_CHECKING:
     from mewcode.tools.base import ToolCall, ToolResult
 
 
+class AgentMode(StrEnum):
+    """Agent 的供应商无关运行模式。"""
+
+    NORMAL = "normal"
+    PLAN = "plan"
+
+
 class _ChatMessageMeta(type):
     def __call__(cls, *args: object, **kwargs: object) -> ChatMessage:
         if cls is ChatMessage:
@@ -67,6 +74,8 @@ class TokenUsage:
 
     input_tokens: int | None
     output_tokens: int | None
+    cache_creation_input_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
 
     @property
     def total_tokens(self) -> int | None:
@@ -87,7 +96,22 @@ class TokenUsage:
             if self.output_tokens is None or other.output_tokens is None
             else self.output_tokens + other.output_tokens
         )
-        return TokenUsage(input_tokens, output_tokens)
+        cache_creation_input_tokens = (
+            None
+            if self.cache_creation_input_tokens is None or other.cache_creation_input_tokens is None
+            else self.cache_creation_input_tokens + other.cache_creation_input_tokens
+        )
+        cache_read_input_tokens = (
+            None
+            if self.cache_read_input_tokens is None or other.cache_read_input_tokens is None
+            else self.cache_read_input_tokens + other.cache_read_input_tokens
+        )
+        return TokenUsage(
+            input_tokens,
+            output_tokens,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+        )
 
 
 class ProviderEventKind(StrEnum):

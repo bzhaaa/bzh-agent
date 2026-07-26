@@ -26,11 +26,11 @@ async def event_source(events: list[ProviderEvent]) -> AsyncIterator[ProviderEve
 
 
 def test_usage_accumulates_and_unknown_propagates() -> None:
-    known = TokenUsage(10, 4)
+    known = TokenUsage(10, 4, 3, 2)
     assert known.total_tokens == 14
-    assert known.accumulate(TokenUsage(3, 2)) == TokenUsage(13, 6)
-    unknown = known.accumulate(TokenUsage(None, 2))
-    assert unknown == TokenUsage(None, 6)
+    assert known.accumulate(TokenUsage(3, 2, 1, 5)) == TokenUsage(13, 6, 4, 7)
+    unknown = known.accumulate(TokenUsage(None, 2, 1, None))
+    assert unknown == TokenUsage(None, 6, 4, None)
     assert unknown.total_tokens is None
 
 

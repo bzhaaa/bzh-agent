@@ -22,7 +22,7 @@ class WriteFileTool:
     policy = ToolExecutionPolicy.SERIAL_SIDE_EFFECT
     definition = ToolDefinition(
         "write_file",
-        "在项目内新建 UTF-8 文本文件或完整覆盖已有文件。",
+        "在项目内新建或完整覆盖 UTF-8 文本文件。覆盖已有文件前必须先读取；小范围变化优先使用 edit_file。",
         WriteFileArguments.model_json_schema(),
     )
 

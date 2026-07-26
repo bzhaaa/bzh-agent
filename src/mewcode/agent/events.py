@@ -4,13 +4,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal
 
-from mewcode.models import TokenUsage
+from mewcode.models import AgentMode, TokenUsage
 from mewcode.tools.base import ToolCall, ToolResult
-
-
-class AgentMode(StrEnum):
-    NORMAL = "normal"
-    PLAN = "plan"
 
 
 class AgentEventKind(StrEnum):
