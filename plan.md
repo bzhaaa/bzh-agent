@@ -1,90 +1,211 @@
-# MewCode Agent Loop Plan
+# MewCode 结构化系统提示与缓存 Plan
 
 ## 架构概览
 
-采用独立 `AgentRunner` 方案。现有 Provider 和工具执行层继续负责协议与单工具行为，在它们之上增加流式收集、工具调度和循环控制三层。
+采用独立 Prompt Pipeline。AgentRunner 在每次模型请求前构造供应商无关的请求信封，Provider 只负责协议映射。
 
 ```text
 CLI 组装
- ├─ Provider
- ├─ ToolRegistry / ToolExecutor
- ├─ ToolScheduler
+ ├─ StablePromptBuilder
+ ├─ EnvironmentCollector
+ ├─ ReminderScheduler
  ├─ AgentRunner
- ├─ ChatSession
- └─ MewCodeApp
-        │
-        │ 用户输入、/plan、/do、取消
-        ▼
-   ChatSession
-    ├─ 保存历史与 Plan Mode 状态
-    ├─ 解析会话命令
-    ├─ 提供本轮历史检查点提交入口
-    └─ 创建 AgentRunRequest
-              │
-              ▼
+ └─ OpenAI / Anthropic Provider
+             │
+             ▼
+用户提交 → ChatSession
+             │ 真实用户任务、模式状态、可选插槽
+             ▼
          AgentRunner
-          ├─ 控制 1..10 次迭代
-          ├─ 判断正常完成与停止条件
-          ├─ 维护本轮未知工具计数和 Token 累计
-          └─ 产生 AgentEvent
-              │
-      ┌───────┴────────┐
-      ▼                ▼
-StreamCollector    ToolScheduler
- ├─ 消费 Provider 流  ├─ 按原顺序划分执行段
- ├─ 实时转发增量      ├─ 读工具段并发
- ├─ 收集完整响应      ├─ 副作用工具串行
- └─ 验证正常结束      └─ 保持结果原始顺序
-      │                │
-      └───────┬────────┘
-              ▼
-        下一次模型请求
+             │ 每次迭代
+             ├─ 选择 Normal / Plan 工具集合
+             ├─ 读取当前环境快照
+             ├─ 生成完整或精简 system-reminder
+             └─ 构造 PromptEnvelope
+                    ├─ stable_system
+                    ├─ system_supplements
+                    ├─ tools
+                    └─ history + pending user message
+                              │
+                 ┌────────────┴────────────┐
+                 ▼                         ▼
+          AnthropicProvider          OpenAIProvider
+          ├─ 显式 cache_control       ├─ 稳定 system 前缀
+          ├─ system content blocks    ├─ 动态 system 消息
+          └─ cache create/read        └─ cached_tokens
+                 │                         │
+                 └────────────┬────────────┘
+                              ▼
+                      ProviderEvent / AgentEvent
 ```
 
 各层职责：
 
-1. **Provider 事件层。** OpenAI 与 Anthropic 继续解析各自流协议，但只产生供应商无关的底层事件，包括 thinking、文本、完整工具调用、Token 用量和正常结束。
-2. **StreamCollector。** 每次模型请求创建一个收集器。它把 thinking 和文本立即转换为 Agent 事件，同时收集完整文本、工具调用和 Token 用量；只有看到合法结束事件后才提供完整响应。
-3. **ToolScheduler。** 根据当前模式可用的工具集合执行一批调用。它只依赖工具注册中心、执行器和工具安全分类，不依赖 Provider、Session 或 TUI。
-4. **AgentRunner。** 实现 ReAct 状态机。它使用收集器请求模型，使用调度器执行工具，通过历史提交接口保存完整检查点，并把所有过程转换为统一 Agent 事件。
-5. **ChatSession。** 从现有“两次请求状态机”收缩为会话外观层，负责内存历史、Plan Mode 状态、`/plan`/`/do` 解析和检查点提交，不再包含工具循环细节。
-6. **MewCodeApp。** 只消费 Agent 事件并更新 transcript、工具记录、模式标识和进度，不再根据工具数量或 Provider 异常决定是否继续。
-
-取消改为显式的本轮取消控制，而不是直接把 TUI Worker 当成业务取消机制：
-
-1. `Ctrl+C` 通知当前 Agent Run 取消。
-2. 收集器取消正在等待的 Provider 流。
-3. 调度器取消并回收所有未完成工具任务。
-4. 命令工具继续执行既有进程组终止逻辑。
-5. AgentRunner 产生 `cancelled` 停止事件后结束。
-6. 应用退出等强制取消路径仍保留底层任务取消作为兜底清理。
-
-历史通过 ChatSession 提供的检查点提交入口逐步保存。AgentRunner 不直接持有 UI，也不依赖历史具体存储方式，后续可以把内存历史替换为持久化实现。
+1. **稳定提示构建层。** 保存七个固定模块及其优先级，启动时构建字节稳定的系统提示。它不读取环境、模式、历史或 Provider 配置。
+2. **环境采集层。** 每次 Provider 请求前生成有界快照，包括脱敏项目路径、平台、Shell、日期时区、Git 分支和 dirty 布尔状态。Git 不可用时返回安全的 unknown，不阻塞请求。
+3. **动态提醒层。** 根据当前模式和 Agent 迭代号生成完整或精简模式约束，再按“环境、自定义指令、Skill、记忆”顺序包装成一个 `<system-reminder>`。提醒仅存在于当前请求。
+4. **请求信封层。** 把稳定提示、动态提醒、当前模式工具定义和真实历史组合为不可变请求对象。AgentRunner 不再分别向 Provider 传 `messages` 和 `tools`。
+5. **Provider 映射层。** Anthropic 将稳定提示、动态提醒和工具缓存点映射到原生 content blocks；OpenAI 将其映射为稳定 system 消息、动态 system 消息和工具列表。协议专属缓存字段不向上泄漏。
+6. **用量归一化层。** 保留现有输入、输出 Token 语义，并增加缓存创建与缓存读取明细。缓存明细不重复计入总 Token，避免破坏当前 TUI 的总量显示。
+7. **会话边界。** ChatSession 只保存真实用户消息、助手消息和工具结果。`/plan` 保存用户任务正文，`/do` 保存用户的执行意图；环境和模式提醒永远不提交历史。
 
 ## 核心数据结构
 
-### ProviderEvent
+### AgentMode
 
-现有 `StreamEvent` 拆成仅供 Provider 与收集器通信的 `ProviderEvent`，避免 TUI 直接消费协议层事件。
+`AgentMode` 从 `agent/events.py` 移到共享的 `models.py`，Agent 包继续重新导出，现有调用方无需改变导入方式。Prompt 层由此只依赖共享领域模型，不反向依赖 Agent 包。
+
+### PromptSection
 
 ```python
-class ProviderEventKind(StrEnum):
-    THINKING_DELTA = "thinking_delta"
-    TEXT_DELTA = "text_delta"
-    TOOL_CALL = "tool_call"
-    TOKEN_USAGE = "token_usage"
-    DONE = "done"
+class PromptChannel(StrEnum):
+    STABLE = "stable"
+    SUPPLEMENT = "supplement"
 
 
 @dataclass(frozen=True, slots=True)
-class ProviderEvent:
-    kind: ProviderEventKind
-    delta: str = ""
-    tool_call: ToolCall | None = None
-    usage: TokenUsage | None = None
+class PromptSection:
+    name: str
+    priority: int
+    content: str
+    channel: PromptChannel
 ```
 
-Provider 在正常流结束前最多产生一次归一化 Token 用量。未提供用量时不伪造事件，由收集器补成未知值。
+固定优先级：
+
+```text
+100  identity
+200  system_constraints
+300  task_mode
+400  action_execution
+500  tool_usage
+600  tone_style
+700  text_output
+800  environment
+900  custom_instructions
+1000 active_skills
+1100 long_term_memory
+```
+
+按 priority 升序排列。名称或优先级重复时拒绝组装，避免不确定顺序。未来插入模块可以使用中间优先级，不需要修改拼装算法。
+
+### PromptOptions
+
+```python
+@dataclass(frozen=True, slots=True)
+class PromptOptions:
+    custom_instructions: str | None = None
+    active_skills: tuple[str, ...] = ()
+    long_term_memory: str | None = None
+```
+
+- Skill 保留调用方给出的顺序。
+- 每个可选部分最多 16 KiB UTF-8。
+- 可选内容合计最多 28 KiB，为环境、模式和标签保留 4 KiB。
+- 完整补充消息最多 32 KiB UTF-8。
+- 超限或仅含空白的 Skill 条目抛出 `PromptBuildError`；空的可选模块直接跳过。
+- CLI 默认构造全空 Options。
+
+### EnvironmentSnapshot
+
+```python
+@dataclass(frozen=True, slots=True)
+class EnvironmentSnapshot:
+    project_root: str
+    platform: str
+    shell: str
+    current_date: str
+    timezone: str
+    git_branch: str
+    git_dirty: bool | None
+    mode: AgentMode
+```
+
+`project_root` 将用户主目录前缀显示为 `~`。`git_dirty=None` 表示非 Git 项目或无法确定，不保存文件列表。
+
+### ReminderDetail
+
+```python
+class ReminderDetail(StrEnum):
+    FULL = "full"
+    COMPACT = "compact"
+
+
+class ReminderScheduler:
+    def detail_for(self, iteration: int) -> ReminderDetail:
+        # 1、6 为 FULL；其余为 COMPACT
+        ...
+```
+
+计数直接使用 AgentRunner 现有的 1-based iteration，因此每次用户提交自动重置。
+
+### StructuredPrompt
+
+```python
+@dataclass(frozen=True, slots=True)
+class StructuredPrompt:
+    stable_system: str
+    supplements: tuple[str, ...]
+```
+
+- `stable_system` 是七个固定模块按空行连接的结果。
+- 当前版本只产生一个 supplement，使用 `<system-reminder>` 包裹环境、模式和可选模块。
+- tuple 为后续增加项目指令等独立系统补充消息保留接口。
+
+### PromptEnvelope
+
+```python
+@dataclass(frozen=True, slots=True)
+class PromptEnvelope:
+    prompt: StructuredPrompt
+    messages: tuple[ChatMessage, ...]
+    tools: tuple[ToolDefinition, ...]
+```
+
+它是 Agent 与 Provider 的唯一请求边界，不包含任何 Anthropic 或 OpenAI 原生字段。
+
+### PromptPipeline
+
+```python
+class PromptPipeline:
+    async def build(
+        self,
+        *,
+        messages: Sequence[ChatMessage],
+        tools: Sequence[ToolDefinition],
+        project_root: Path,
+        mode: AgentMode,
+        iteration: int,
+        options: PromptOptions,
+    ) -> PromptEnvelope: ...
+```
+
+内部依次构建稳定模块、采集环境、选择提醒详细度、验证边界、生成 supplement、冻结消息和工具顺序。
+
+### Provider 接口
+
+```python
+class LLMProvider(Protocol):
+    def stream(self, request: PromptEnvelope) -> AsyncIterator[ProviderEvent]: ...
+```
+
+现有 `stream(messages, tools)` 和 AgentRunner 中基于函数签名的兼容分支被删除，所有真实与测试 Provider 统一迁移到 Envelope。
+
+### AgentRunRequest
+
+```python
+@dataclass(frozen=True, slots=True)
+class AgentRunRequest:
+    history: tuple[ChatMessage, ...]
+    user_message: UserMessage
+    mode: AgentMode
+    control: AgentRunControl
+    history_sink: HistorySink
+    prompt_options: PromptOptions = PromptOptions()
+    max_iterations: int = 10
+```
+
+Options 属于本次用户提交，不写入历史。
 
 ### TokenUsage
 
@@ -93,553 +214,454 @@ Provider 在正常流结束前最多产生一次归一化 Token 用量。未提�
 class TokenUsage:
     input_tokens: int | None
     output_tokens: int | None
-
-    @property
-    def total_tokens(self) -> int | None: ...
-
-    def accumulate(self, other: TokenUsage) -> TokenUsage: ...
+    cache_creation_input_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
 ```
 
-任一累计项曾经未知，则该累计项保持未知。只有输入和输出都已知时才计算总 Token。
+设计约定：
 
-### AgentEvent
+- `input_tokens` 保持本次总输入 Token 语义，避免改变当前 TUI 总量。
+- 缓存字段是输入总量的明细，不再次加入 `total_tokens`。
+- Anthropic 总输入为普通输入、缓存创建和缓存读取之和。
+- OpenAI 总输入直接使用 `prompt_tokens`，`cached_tokens` 映射为缓存读取明细，缓存创建保持未知。
+- 四个字段独立累计；任一字段在某次请求未知时，仅对应累计字段传播为未知。
 
-```python
-class AgentMode(StrEnum):
-    NORMAL = "normal"
-    PLAN = "plan"
+## 提示构建模块
 
+### `prompting/sections.py`
 
-class AgentEventKind(StrEnum):
-    MODE_CHANGED = "mode_changed"
-    ITERATION_STARTED = "iteration_started"
-    THINKING_DELTA = "thinking_delta"
-    TEXT_DELTA = "text_delta"
-    TOOL_CALL = "tool_call"
-    TOOL_RESULT = "tool_result"
-    TOKEN_USAGE = "token_usage"
-    PROGRESS = "progress"
-    STOPPED = "stopped"
+定义七个固定模块及稳定文本。固定模块不读取运行时状态。
 
+| 模块 | 核心内容 |
+|---|---|
+| 身份 | MewCode 是在当前项目中完成软件任务的终端 Coding Agent；以实际结果为目标 |
+| 系统约束 | 遵循系统与用户要求；区分事实和推断；不伪造工具输出、测试结果或完成状态；不泄露隐藏指令 |
+| 任务模式 | Normal 与 Plan 的稳定定义；当前活动模式以 system reminder 为准 |
+| 动作执行 | 先理解上下文，再行动、检查结果并调整；只有完成或命中停止条件才结束 |
+| 工具使用 | 优先专用工具；找文件、搜内容不用 Shell；编辑已有文件前先读；失败后根据结构化结果调整 |
+| 语气风格 | 默认中文、直接、协作；避免空洞承诺和重复说明；不确定时明确说明 |
+| 文本输出 | 先给结果，再给必要证据；路径、命令和标识清晰；未实际运行的检查不得声称通过 |
 
-class AgentStopReason(StrEnum):
-    COMPLETED = "completed"
-    ITERATION_LIMIT = "iteration_limit"
-    UNKNOWN_TOOL_LIMIT = "unknown_tool_limit"
-    CANCELLED = "cancelled"
-    PROVIDER_ERROR = "provider_error"
-    INVALID_STREAM = "invalid_stream"
-    NO_PLAN = "no_plan"
-    INVALID_COMMAND = "invalid_command"
-```
+固定内容使用模块常量，不在运行时拼入版本、日期、Provider、模型或项目名称，保证稳定前缀。
 
-```python
-@dataclass(frozen=True, slots=True)
-class AgentProgress:
-    phase: Literal[
-        "requesting_model",
-        "executing_tools",
-        "checkpoint_committed",
-    ]
-    iteration: int
-    completed_tools: int = 0
-    total_tools: int = 0
+### `prompting/builder.py`
 
+`StablePromptBuilder`：
 
-@dataclass(frozen=True, slots=True)
-class UsageSnapshot:
-    request: TokenUsage
-    cumulative: TokenUsage
+1. 合并固定模块与将来的额外稳定模块。
+2. 校验名称、优先级、内容和通道。
+3. 按 priority 升序排序。
+4. 使用恰好一个空行连接。
+5. 在实例创建后缓存结果，后续请求直接复用。
+6. 相同名称、相同优先级、空内容或错误通道抛出 `PromptBuildError`。
 
-
-@dataclass(frozen=True, slots=True)
-class AgentEvent:
-    kind: AgentEventKind
-    iteration: int = 0
-    mode: AgentMode = AgentMode.NORMAL
-    delta: str = ""
-    tool_call: ToolCall | None = None
-    tool_result: ToolResult | None = None
-    usage: UsageSnapshot | None = None
-    progress: AgentProgress | None = None
-    stop_reason: AgentStopReason | None = None
-```
-
-每次运行恰好产生一个最终 `STOPPED` 事件。Provider 错误和无效流先在 Agent 层转换为脱敏停止事件，TUI 不再捕获 Provider 异常来决定业务状态。
-
-### CollectedResponse 与 StreamCollector
-
-```python
-@dataclass(frozen=True, slots=True)
-class CollectedResponse:
-    content: str
-    tool_calls: tuple[ToolCall, ...]
-    usage: TokenUsage
-
-
-class StreamCollector:
-    def __init__(
-        self,
-        *,
-        iteration: int,
-        mode: AgentMode,
-        control: AgentRunControl,
-    ) -> None: ...
-
-    async def consume(
-        self,
-        source: AsyncIterator[ProviderEvent],
-    ) -> AsyncIterator[AgentEvent]: ...
-
-    @property
-    def response(self) -> CollectedResponse: ...
-```
-
-`consume()` 实时转发 thinking 和文本事件，同时收集完整响应。只有消费到唯一合法的 `DONE` 后才能读取 `response`；提前结束、重复结束或字段冲突均产生无效流错误。
-
-### 工具执行策略与 ToolScheduler
-
-```python
-class ToolExecutionPolicy(StrEnum):
-    PARALLEL_READ = "parallel_read"
-    SERIAL_SIDE_EFFECT = "serial_side_effect"
-```
-
-工具策略固定为：
-
-- `read_file`、`find_files`、`search_code`：`PARALLEL_READ`
-- `write_file`、`edit_file`、`execute_command`：`SERIAL_SIDE_EFFECT`
-
-```python
-@dataclass(frozen=True, slots=True)
-class ToolSegmentResult:
-    calls: tuple[ToolCall, ...]
-    results: tuple[ToolResult, ...]
-
-
-class ToolScheduler:
-    async def execute(
-        self,
-        calls: Sequence[ToolCall],
-        context: ToolContext,
-        control: AgentRunControl,
-    ) -> AsyncIterator[ToolSegmentResult]: ...
-```
-
-调度器逐段产生结果：并发读段全部结束后按原顺序返回，副作用段每次只含一个调用。Plan Mode 使用只包含三个读工具的注册中心视图，因此未开放工具会得到 `UNKNOWN_TOOL`，不会绕过模式边界执行。
-
-### AgentRunControl
-
-```python
-class AgentRunControl:
-    def cancel(self) -> None: ...
-    def is_cancelled(self) -> bool: ...
-    async def wait_cancelled(self) -> None: ...
-```
-
-收集器和调度器同时等待当前工作与取消信号。取消发生时主动取消底层 Provider 读取或工具任务，完成清理后由 AgentRunner 产生停止事件。
-
-### AgentRunner 与历史提交
-
-```python
-class HistorySink(Protocol):
-    async def commit(
-        self,
-        messages: Sequence[ChatMessage],
-    ) -> None: ...
-
-
-@dataclass(frozen=True, slots=True)
-class AgentRunRequest:
-    history: tuple[ChatMessage, ...]
-    user_message: UserMessage
-    mode: AgentMode
-    max_iterations: int
-    control: AgentRunControl
-    history_sink: HistorySink
-
-
-class AgentRunner:
-    async def run(
-        self,
-        request: AgentRunRequest,
-    ) -> AsyncIterator[AgentEvent]: ...
-```
-
-Runner 只接收历史快照、规范化用户消息、当前模式、取消控制和历史提交接口。它不持有 TUI 或 ChatSession。
-
-### ChatSession
-
-```python
-class ChatSession:
-    @property
-    def history(self) -> tuple[ChatMessage, ...]: ...
-
-    @property
-    def mode(self) -> AgentMode: ...
-
-    async def stream_reply(
-        self,
-        user_input: str,
-    ) -> AsyncIterator[AgentEvent]: ...
-
-    def cancel_current(self) -> None: ...
-```
-
-ChatSession 保存当前模式、可执行计划状态、当前运行的取消控制和内存历史。`/plan <任务>`、Plan 模式后续消息和 `/do` 被转换成明确的模型指令文本；TUI transcript 仍展示用户原始输入。
-
-## 模块设计
-
-### AgentRunner 循环
-
-每次 `run()`：
-
-1. 初始化迭代计数、连续未知工具计数和累计 Token。
-2. 将历史快照与尚未提交的本轮用户消息组成请求上下文。
-3. 产生迭代开始和请求进度事件。
-4. 通过 Provider 与 StreamCollector 消费一次完整模型流。
-5. 产生本次及累计 Token 用量事件。
-6. 响应不含工具时，验证文字非空，提交用户消息和最终助手消息，产生 `STOPPED(COMPLETED)`。
-7. 响应包含工具时，先产生调用事件，再由当前模式的 ToolScheduler 执行。
-8. 收集全部结果并按调用顺序产生结果事件。
-9. 提交用户消息、助手工具请求和全部工具结果。
-10. 更新连续未知工具计数。
-11. 连续两次均只包含未知工具时停止。
-12. 第 10 次工具迭代完成后停止，不发起第 11 次请求。
-13. 其他情况使用已提交历史进入下一次迭代。
-
-Provider 错误和无效流由 Runner 转换成脱敏停止事件。普通工具失败不会停止循环。
-
-### 历史检查点
-
-一次工具检查点固定为：
+`SupplementBuilder` 当前输出：
 
 ```text
-首次工具迭代：
-UserMessage
-AssistantMessage(text + tool_calls)
-ToolResultMessage × N
-
-后续工具迭代：
-AssistantMessage(text + tool_calls)
-ToolResultMessage × N
+<system-reminder>
+<environment>
+项目根目录、平台、Shell、日期、时区、Git、当前模式
+完整或精简模式约束
+</environment>
+<custom-instructions>...</custom-instructions>
+<active-skills>...</active-skills>
+<long-term-memory>...</long-term-memory>
+</system-reminder>
 ```
 
-最终文字检查点为：
+- 空的可选标签完全省略。
+- 所有动态文本先做 XML 文本转义，不能通过 `</system-reminder>` 提前闭合标签。
+- Skill 按调用方顺序编号并聚合在一个标签内。
+- 先执行单部分、可选合计和 supplement 总长校验，再生成字符串。
+- supplement 每次重新生成，但不会追加到上一次结果。
 
-```text
-首次直接回答：
-UserMessage
-AssistantMessage(final_text)
+### `prompting/reminders.py`
 
-工具循环后的最终回答：
-AssistantMessage(final_text)
-```
+完整 Normal 提醒包含：允许使用当前全部工具；持续调查、执行和验证；写改前先读；命令服从确认；任务未完成时继续循环。
 
-工具批次必须获得每个调用的结果后才提交。
+完整 Plan 提醒包含：只调查和形成计划；不得修改文件或执行命令；只能使用当前三个只读工具；用户要求直接执行时仍保持 Plan。
 
-取消处理：
+精简提醒：
 
-- 模型流中取消：当前响应不完整，直接丢弃，保留更早检查点。
-- 工具执行中取消：保留已完成结果，为正在执行或尚未启动的调用生成 `CANCELLED` 结果，提交合法完整工具检查点后停止。
-- 命令执行中取消：先终止进程组，再生成取消结果。
-- 应用退出等强制任务取消：完成资源清理后继续向上传播。
+- Normal：`当前为 Normal Mode；继续执行并验证，编辑已有文件前先读取。`
+- Plan：`当前为 Plan Mode；保持只读，只调查并更新计划。`
 
-### ToolScheduler 分段
+`ReminderScheduler` 只根据 iteration 返回 FULL 或 COMPACT，不保存跨 Run 状态。
 
-注册中心增加只读子集能力：
+### `prompting/environment.py`
+
+`EnvironmentCollector.collect()` 每次请求执行：
+
+- 项目路径位于用户主目录下时用 `~` 替换主目录前缀。
+- 平台来自标准平台信息，不包含主机名。
+- Shell 只读取允许的 Shell 路径来源，不枚举环境变量。
+- 日期和时区使用当前本地时区，格式稳定。
+- Git 分支优先取 symbolic branch；detached HEAD 使用有前缀的短提交标识。
+- dirty 只记录布尔值，不保存状态输出或文件名。
+- Git 子进程使用参数数组、固定项目目录、1 秒超时和有界读取。
+- Git 不存在、超时、非仓库或权限失败时返回 unknown，不向模型暴露异常正文。
+
+### `prompting/pipeline.py`
+
+`PromptPipeline.build()`：
+
+1. 获取已经缓存的 stable system。
+2. 异步采集当前环境。
+3. 根据 mode 与 iteration 选择模式提醒。
+4. 合并并验证 `PromptOptions`。
+5. 构建唯一的 system reminder。
+6. 冻结 messages 与 tools，返回 `PromptEnvelope`。
+
+该模块不访问 Provider，不修改历史，也不保存 API Key。
+
+## Agent、Provider 与工具集成
+
+### `agent/runner.py`
+
+`AgentRunner` 新增 `PromptPipeline` 依赖。每次迭代：
+
+1. 选择当前 Normal 或 Plan Scheduler。
+2. 生成候选历史，包含尚未提交的真实用户消息。
+3. 从 Scheduler 取得稳定顺序的工具定义。
+4. 调用 Prompt Pipeline 构造 Envelope。
+5. 调用 `provider.stream(envelope)`。
+6. 沿用现有 Collector、工具调度、检查点和停止条件。
+
+删除基于 `inspect.signature()` 的旧 Provider 兼容分支。提示补充消息只存在于 Envelope，不加入 candidate、checkpoint 或 HistorySink。`PromptOptions` 在一次 Agent Run 开始时冻结。
+
+### `session.py`
+
+移除 `_plan_instruction()`、`_plan_followup()` 和 `_do_instruction()`。
+
+| 输入 | 历史中的真实 UserMessage | 系统补充消息 |
+|---|---|---|
+| `/plan 调查模块` | `调查模块` | 完整 Plan 约束 |
+| Plan 中普通补充 | 用户原文 | Plan 完整或精简约束 |
+| `/do` | `/do` | 完整 Normal 约束 |
+| Normal 普通输入 | 用户原文 | Normal 完整或精简约束 |
+
+`/plan` 空任务、无计划 `/do`、计划就绪和新规划清理旧状态的行为不变。
+
+Session 保存当前 `PromptOptions`，提供只允许在没有活动 Run 时调用的程序化更新入口。每次创建 `AgentRunRequest` 时复制当前 Options。
+
+### `providers/anthropic.py`
+
+System 映射：
 
 ```python
-class ToolRegistry:
-    def subset(self, names: Collection[str]) -> ToolRegistry: ...
+system = [
+    {
+        "type": "text",
+        "text": envelope.prompt.stable_system,
+        "cache_control": {"type": "ephemeral"},
+    },
+    {
+        "type": "text",
+        "text": envelope.prompt.supplements[0],
+    },
+]
 ```
 
-CLI 从同一默认注册中心创建 Normal 六工具环境和 Plan 三个读工具环境。
+工具保持原顺序，并在最后一个工具上增加 `cache_control: {"type": "ephemeral"}`。Normal 六工具和 Plan 三工具各自形成稳定缓存版本。使用默认 ephemeral TTL，不新增配置或主动保活。
 
-分段算法按调用顺序单次扫描：
+历史继续转换为 Anthropic `user`、`assistant`、`tool_use` 和 `tool_result`，动态 system block 不参与相邻角色合并。Extended thinking 参数和流解析保持原样。
+
+用量解析：
+
+- `input_tokens` 读取普通输入。
+- `cache_creation_input_tokens` 和 `cache_read_input_tokens` 不再用默认 0 掩盖缺失字段。
+- 对官方返回的已知三个输入分类求和，作为统一总输入。
+- 兼容服务缺少缓存明细时，保留明细未知，并沿用其 `input_tokens` 作为总输入。
+- 所有已返回值必须是非负整数，否则按无效流停止。
+
+### `providers/openai.py`
+
+请求消息顺序：
 
 ```text
-连续 PARALLEL_READ → 一个并发段
-SERIAL_SIDE_EFFECT → 一个单调用串行段
-未知工具 → 一个立即失败的串行边界
+system: stable_system
+system: <system-reminder>...</system-reminder>
+历史与当前真实用户消息
 ```
+
+使用 `system` 而不是 `developer`，保持 Chat Completions 和现有兼容服务范围。工具定义仍位于请求的 `tools` 字段，不发送 `cache_control`。
+
+用量映射：
 
 ```text
-read A ─┐
-read B ─┴─ 并发 → write C → read D ─┐
-                              grep E ─┴─ 并发 → edit F
+prompt_tokens                         → input_tokens
+completion_tokens                     → output_tokens
+prompt_tokens_details.cached_tokens   → cache_read_input_tokens
+无对应字段                            → cache_creation_input_tokens = unknown
 ```
 
-并发段使用 `asyncio` 任务组。普通工具失败被收集为结果，不取消同组任务；外部取消则取消整个任务组。每段输出和最终批次结果都恢复为原调用顺序。
+`cached_tokens` 是 `prompt_tokens` 的明细，不再次计入总量。兼容服务缺少 `prompt_tokens_details` 时缓存读取保持未知。
 
-Plan Mode 中未开放的工具由只读注册中心视为未知工具，因此不会执行。
+### `models.py` 与事件累计
 
-### StreamCollector
+- `total_tokens` 仍只计算 `input_tokens + output_tokens`。
+- `accumulate()` 对四个字段分别累计并独立传播未知。
+- `StreamCollector` 缺失 usage 时生成四字段均未知。
+- `UsageSnapshot` 和 AgentEvent 不增加事件类型。
+- TUI 继续只读取 `total_tokens`，不展示缓存字段。
 
-收集器维护文本片段、完整工具调用、本次 Token 用量和结束状态：
+### 六个工具描述
 
-- thinking/text：立即转发，文本同时加入缓冲。
-- tool call：保存完整调用并转发，但在 `DONE` 前不得执行。
-- usage：只接受一次并保存。
-- done：验证唯一性并关闭收集。
-- 提前结束、重复 done、缺少调用字段或结束原因冲突：拒绝生成完整响应。
+只修改描述，不修改参数 Schema 或执行逻辑：
 
-取消控制与 Provider 下一事件并行等待；取消优先时关闭异步流并回收等待任务。
+- `read_file`：编辑已有文件前的必经读取工具。
+- `write_file`：只用于新建或完整覆盖；覆盖前先读，小范围变化优先 `edit_file`。
+- `edit_file`：先用 `read_file` 获取当前精确原文，只提交唯一、小范围替换。
+- `find_files`：查找路径时优先于 Shell 的 `find`、`ls`。
+- `search_code`：搜索内容时优先于 Shell 的 `grep`、`rg`。
+- `execute_command`：只用于专用工具不能完成的命令、测试或构建，不替代读写改查工具。
 
-### Token 用量归一化
+Registry 保持现有注册顺序，Plan 子集逻辑不变。
 
-OpenAI 请求启用流式 usage 返回：
+### `cli.py`
 
-- `prompt_tokens` → 输入 Token。
-- `completion_tokens` → 输出 Token。
-
-Anthropic 从开始和结束事件收集：
-
-- 普通输入、cache creation 和 cache read Token 合并为输入 Token。
-- `output_tokens` → 输出 Token。
-
-Provider 没有返回 usage 时，收集器生成未知用量。累计过程中任何缺失项都会使对应累计项保持未知。
-
-### ChatSession 与 Plan Mode
-
-ChatSession 解析：
-
-- `/plan <任务>`：切换到 Plan，清除旧计划就绪状态，以只读规划指令包装任务后启动 Runner。
-- Plan Mode 中普通消息：保持 Plan，以“继续调查并更新计划”的指令包装补充内容。
-- `/do`：存在成功计划时切回 Normal、消费计划状态，并以“根据已完成计划开始执行”的指令启动 Runner。
-
-精确的空 `/plan` 和无计划 `/do` 不调用 Provider，只产生本地停止事件。`/do` 开始后保持 Normal，执行失败或取消不会自动回到 Plan。
-
-规划指令只写入模型历史，TUI transcript 显示用户原文。Plan Mode 中一次正常文字完成会把计划就绪状态设为真；失败或取消不会把未完成内容标记为计划。
-
-### TUI 消费
-
-- 每次迭代首次收到 thinking 或文本时创建该迭代的助手记录。
-- 工具调用按事件顺序追加在对应助手文本之后。
-- 工具结果通过调用 ID 更新对应记录。
-- 下一迭代创建新的助手记录，保持“说明 → 工具 → 新说明”的视觉顺序。
-- 模式、迭代、工具进度和累计 Token 显示在底部状态行。
-- `STOPPED` 决定最后记录是完成、取消还是错误，并按需追加状态消息。
-- `Ctrl+C` 先关闭命令确认框，再调用 `ChatSession.cancel_current()`，不直接取消正常业务 Worker。
+CLI 在项目根目录确定后组装 StablePromptBuilder、EnvironmentCollector、ReminderScheduler、PromptPipeline、AgentRunner 和 ChatSession。无新增命令行参数或 YAML 字段。Provider 关闭、命令确认延迟绑定和 TUI 启动流程不变。
 
 ## 模块交互
 
-### 普通循环时序
+### 普通 Agent Run
 
 ```text
-TUI              ChatSession        AgentRunner       Collector/Provider      Scheduler
- │ submit(text)       │                  │                    │                   │
- │───────────────────>│ create request   │                    │                   │
- │                    │─────────────────>│ iteration 1        │                   │
- │<──────────────────────────────────────│ ITERATION_STARTED  │                   │
- │                    │                  │──── stream ────────>│                   │
- │<──────────────────────────────────────── text/thinking ───│                   │
- │<──────────────────────────────────────── TOOL_CALL ───────│                   │
- │<──────────────────────────────────────│ TOKEN_USAGE        │                   │
- │                    │                  │───────────────────────────────────────>│
- │<──────────────────────────────────────────────────── TOOL_RESULT / PROGRESS ─│
- │                    │<─────────────────│ commit checkpoint  │                   │
- │<──────────────────────────────────────│ CHECKPOINT_COMMITTED                  │
- │                    │                  │ iteration 2        │                   │
- │                    │                  │──── stream ────────>│                   │
- │<──────────────────────────────────────── final text ──────│                   │
- │                    │<─────────────────│ commit final       │                   │
- │<──────────────────────────────────────│ STOPPED(COMPLETED) │                   │
+用户输入
+  ↓
+ChatSession 创建真实 UserMessage + PromptOptions 快照
+  ↓
+AgentRunner iteration 1
+  ├─ candidate = 已提交历史 + pending user
+  ├─ tools = Normal 六工具
+  ├─ PromptPipeline 采集环境并生成 FULL reminder
+  ├─ 构造 PromptEnvelope
+  └─ Provider 发起请求
+         ↓
+    文本或工具调用
+         ├─ 最终文本 → 提交真实用户消息与助手消息
+         └─ 工具调用 → 执行、提交工具检查点
+                              ↓
+                     iteration 2
+                     重新采集环境
+                     生成 COMPACT reminder
+                     历史只包含真实消息和工具结果
 ```
 
-单次工具迭代事件顺序：
+第 6 次请求重新使用 FULL reminder。每次请求重新构建 supplement，但 stable system 和同模式 tools 使用同一稳定对象与顺序。
+
+### Plan/Do
 
 ```text
-ITERATION_STARTED
-PROGRESS(requesting_model)
-THINKING_DELTA / TEXT_DELTA
-TOOL_CALL
-TOKEN_USAGE
-PROGRESS(executing_tools)
-TOOL_RESULT
-PROGRESS(checkpoint_committed)
+/plan 调查模块
+  ↓
+Session: mode=PLAN, plan_ready=False
+  ↓
+UserMessage("调查模块")
+  + FULL Plan system-reminder
+  + 三个只读工具
+  ↓
+调查循环完成，真实计划答复进入历史，plan_ready=True
+  ↓
+/do
+  ↓
+Session: mode=NORMAL, plan_ready=False
+  ↓
+UserMessage("/do")
+  + FULL Normal system-reminder
+  + 六个工具
+  ↓
+根据已有计划执行
 ```
 
-最终文字迭代不产生工具事件，提交最终助手消息后产生 `STOPPED(COMPLETED)`。
+Plan 中的普通补充保持用户原文。启动新规划或规划失败时，旧计划就绪状态仍清除。
 
-### Plan Mode 时序
+### Anthropic 缓存边界
 
 ```text
-/plan 任务
-  → MODE_CHANGED(PLAN)
-  → 只读 Agent Loop
-  → STOPPED(COMPLETED)，plan_ready = true
-  → 普通补充仍在 Plan 中更新计划
-  → /do
-  → MODE_CHANGED(NORMAL)，消费 plan_ready
-  → 全工具 Agent Loop
-  → STOPPED(...)
+稳定工具定义（最后一个工具 cache breakpoint）
+稳定七模块 system（cache breakpoint）
+动态 system-reminder（不缓存）
+真实历史与当前用户消息
 ```
 
-新的 `/plan <任务>` 覆盖待执行计划状态，但不删除已有历史。无计划 `/do` 和空 `/plan` 只产生本地状态，不创建模型消息或 Token 用量。
+同一模式的后续请求只改变断点后的内容。Plan 与 Normal 因工具集合不同形成两个独立稳定前缀，不跨模式共享工具缓存。
 
-### 停止状态机
+### OpenAI 自动缓存边界
 
-| 停止原因 | 触发点 | 当前内容处理 | 历史处理 | 后续请求 |
-|---|---|---|---|---|
-| `COMPLETED` | 完整响应不含工具且文本非空 | 展示最终文字 | 提交最终消息 | 不再请求 |
-| `ITERATION_LIMIT` | 第 10 次工具批次完成 | 展示上限状态 | 提交第 10 次工具检查点 | 禁止第 11 次 |
-| `UNKNOWN_TOOL_LIMIT` | 连续第二轮只含未知工具 | 展示停止状态 | 提交第二轮错误结果检查点 | 不再请求 |
-| `CANCELLED` | 用户取消 | 清理当前流或工具任务 | 保留旧检查点；工具阶段补齐取消结果 | 不再请求 |
-| `PROVIDER_ERROR` | 认证、限流、连接或服务错误 | 展示脱敏错误 | 丢弃未完成响应 | 不重试 |
-| `INVALID_STREAM` | 流提前结束、冲突或残缺 | 展示流错误 | 丢弃未完成响应，工具不执行 | 不重试 |
-| `NO_PLAN` | 无成功计划时输入 `/do` | 显示本地提示 | 不改变历史 | 不请求 |
-| `INVALID_COMMAND` | `/plan` 缺少任务 | 显示本地提示 | 不改变历史 | 不请求 |
+```text
+稳定 system
+动态 system-reminder
+真实历史与当前用户消息
+稳定 tools
+```
 
-每个模型请求即使失败，也产生一次 Token 用量事件；Provider 未提供的字段标记为未知。停止事件始终位于本次运行事件流末尾。
+MewCode 只保证请求内容与顺序稳定，不推断服务端内部序列化顺序。动态内容变化后，是否命中及命中长度以 `cached_tokens` 实际返回为准。
 
-### 未知工具计数
+### 用量事件
 
-- 所有调用都不在当前注册中心：计数加一。
-- 至少一个调用有效：计数清零。
-- 未知调用分别获得 `UNKNOWN_TOOL` 结果。
-- 有效调用照常执行。
-- Plan Mode 中未开放工具按未知调用处理。
-- 第二次纯未知调用的错误结果先进入历史，随后停止。
+```text
+Provider 原生 usage
+  ↓
+TokenUsage(input, output, cache_creation, cache_read)
+  ↓
+StreamCollector
+  ↓
+UsageSnapshot(request, cumulative)
+  ↓
+AgentEvent.TOKEN_USAGE
+```
 
-### 取消竞争
+四个字段分别校验和累计。TUI 仍只读取 `total_tokens`，独立测试或缓存验证器读取缓存明细。
 
-1. 已得到完整 Provider `DONE` 的响应按完整响应处理。
-2. 已返回 `ToolResult` 的工具保留实际结果。
-3. 尚未返回结果的工具标记为 `CANCELLED`。
-4. 尚未启动的后续执行段不启动并生成取消结果。
-5. 取消后不启动新 Provider 请求。
-6. 每次运行只产生一个 `STOPPED(CANCELLED)`。
+### 边界校验
 
-外层任务被应用强制取消时优先完成资源清理；消费者已经终止时不保证投递最终事件。
+`PromptOptions` 在 Session 创建或程序化更新时立即验证。更新时若已有活动 Run 则拒绝，失败不修改原有 Options。默认 CLI 路径不会在 Agent 循环中遇到用户可触发的 PromptBuildError。
+
+### 环境任务与取消
+
+AgentRunner 把 `PromptPipeline.build()` 放入独立异步任务，并使用现有 `AgentRunControl` 与其竞争：
+
+- 取消先发生时取消 Pipeline，不发起 Provider 请求。
+- Git 子进程收到任务取消或 1 秒超时时终止并等待回收。
+- 环境采集普通失败时返回 unknown，继续请求。
+- 强制 Worker 取消时 `CancelledError` 继续向上传播。
+
+### 历史不污染
+
+七模块 system、system reminder、环境、模式约束、可选插槽和缓存元数据均不传给 HistorySink。HistorySink 只接收 `UserMessage`、`AssistantMessage` 和 `ToolResultMessage`。
 
 ## 文件组织
 
 ```text
-src/mewcode/
-├── agent/
-│   ├── __init__.py      # Agent 公共入口
-│   ├── control.py       # 显式取消信号
-│   ├── events.py        # Agent 事件、模式、进度和停止原因
-│   ├── collector.py     # Provider 流双路收集
-│   ├── scheduler.py     # 工具分段与并发调度
-│   └── runner.py        # ReAct 循环状态机
-├── models.py            # 会话消息、ProviderEvent、TokenUsage
-├── session.py           # 历史、Plan Mode 和命令解析
-├── cli.py               # 运行环境组装
-├── tui.py               # AgentEvent 展示
-├── providers/
-│   ├── base.py
-│   ├── openai.py
-│   └── anthropic.py
-└── tools/
-    ├── base.py
-    ├── registry.py
-    ├── read_file.py
-    ├── find_files.py
-    ├── search_code.py
-    ├── write_file.py
-    ├── edit_file.py
-    └── execute_command.py
+mew/
+├── src/mewcode/
+│   ├── prompting/
+│   │   ├── __init__.py
+│   │   ├── errors.py
+│   │   ├── models.py
+│   │   ├── sections.py
+│   │   ├── builder.py
+│   │   ├── reminders.py
+│   │   ├── environment.py
+│   │   └── pipeline.py
+│   ├── agent/runner.py
+│   ├── providers/{base.py,anthropic.py,openai.py}
+│   ├── tools/{read_file.py,write_file.py,edit_file.py,find_files.py,search_code.py,execute_command.py}
+│   ├── models.py
+│   ├── session.py
+│   └── cli.py
+├── scripts/verify_prompt_cache.py
+├── tests/
+│   ├── prompting/{test_builder.py,test_environment.py,test_pipeline.py}
+│   ├── fixtures/prompt_eval/{README.md,src/sample.py}
+│   ├── agent/test_runner.py
+│   ├── providers/{test_anthropic.py,test_openai.py}
+│   ├── e2e/mock_llm_server.py
+│   ├── test_session.py
+│   ├── test_cli.py
+│   └── test_tui.py
+├── docs/
+│   ├── evals/003-system-prompt-scenarios.md
+│   └── features/
+│       ├── 003-structured-system-prompt.md
+│       ├── 003-claude-code-system-prompt.md
+│       └── README.md
+├── spec.md
+├── plan.md
+├── task.md
+└── checklist.md
 ```
 
-模块依赖：
+新增文件职责：
 
-```text
-events/control
-      ↑
-collector   tools
-      ↑       ↑
-      runner ← scheduler
-         ↑
-       session
-         ↑
-         tui
-```
+| 文件 | 职责 |
+|---|---|
+| `prompting/models.py` | Section、Options、环境快照、提醒详细度、结构化提示和 Envelope |
+| `prompting/sections.py` | 七个固定模块、优先级和稳定正文 |
+| `prompting/builder.py` | 排序、校验、空行连接、XML 转义和长度限制 |
+| `prompting/reminders.py` | Normal/Plan 完整与精简提醒及第 1/6 次调度 |
+| `prompting/environment.py` | 有界、脱敏、可取消的环境和 Git 采集 |
+| `prompting/pipeline.py` | 组装一次完整 PromptEnvelope |
+| `prompting/errors.py` | 有界且不泄露内容的 PromptBuildError |
+| `verify_prompt_cache.py` | 使用指定 profile 发起固定次数请求，输出脱敏缓存指标 |
+| `003-system-prompt-scenarios.md` | 六类人工对比任务、固定输入、观察维度和记录表 |
+| `tests/fixtures/prompt_eval/` | 可复制到临时目录的最小人工评估项目 |
 
-### 自动化测试
+修改文件职责：
 
-```text
-tests/agent/
-├── test_collector.py
-├── test_scheduler.py
-└── test_runner.py
+| 文件 | 改动 |
+|---|---|
+| `models.py` | 共享 AgentMode；TokenUsage 增加缓存字段 |
+| `providers/base.py` | Provider 接口改为接收 PromptEnvelope |
+| `providers/anthropic.py` | system blocks、工具缓存点及缓存 usage |
+| `providers/openai.py` | 双 system 消息及 cached_tokens |
+| `agent/runner.py` | 每次迭代构造 Envelope，并让提示构建参与取消竞争 |
+| `session.py` | 移除伪用户模式指令，管理 PromptOptions |
+| `cli.py` | 组装 Prompt Pipeline |
+| 六个工具模块 | 强化稳定 description，不改 Schema 和执行逻辑 |
+| Provider/Agent/Session/CLI 测试 | 迁移新请求边界并验证缓存与历史 |
+| `mock_llm_server.py` | 记录 system、cache_control、工具和缓存用量 |
+| `test_tui.py` | 确认缓存明细不进入 UI，既有状态不回归 |
+| `docs/features/README.md` | 登记 003 双文档 |
+| `checklist.md` | 写入自动化、真实缓存、人工对比和 tmux 实证 |
 
-tests/test_session.py
-tests/test_tui.py
-tests/test_cli.py
-tests/tools/test_executor.py
-tests/providers/test_openai.py
-tests/providers/test_anthropic.py
-tests/e2e/mock_llm_server.py
-```
-
-- collector：双路转发、完整收集、无效流、取消。
-- scheduler：分段、并发时序、结果顺序、普通失败、取消补齐。
-- runner：循环、停止条件、Token 累计、检查点。
-- session：Plan Mode 命令和历史状态。
-- TUI：多迭代显示、模式状态、进度、取消和确认。
-- Provider：多工具流和 Token usage。
-- E2E：确定性多步任务、Plan/Do、并发与停止场景。
-
-### 验收与总结文档
-
-```text
-spec.md
-plan.md
-task.md
-checklist.md
-docs/features/002-agent-loop.md
-docs/features/002-claude-code-agent-loop.md
-docs/features/README.md
-```
-
-`checklist.md` 在开发前生成，验收时记录实际结果。两份 002 文档只在功能验收完成后填写测试证据。
+`pyproject.toml` 不新增运行依赖，也不修改 YAML 配置模型。
 
 ## 技术决策
 
 | 决策点 | 选择 | 理由 |
 |---|---|---|
-| 循环归属 | 独立 `AgentRunner` | 避免 ChatSession 同时承担历史、循环、并发和 UI 状态 |
-| 事件边界 | ProviderEvent 与 AgentEvent 分离 | Provider 只表达模型流，TUI 只理解完整 Agent 行为 |
-| 事件传输 | 异步生成器，不增加 Queue | 天然支持背压和异常传播，无需 Actor 生命周期 |
-| 流收集 | 每次请求一个有状态 Collector | 实时转发与完整响应收集共存 |
-| 取消 | 显式取消控制，任务取消兜底 | 能投递停止事件并统一取消 Provider 与工具 |
-| 工具安全性 | 工具声明固定执行策略 | 不根据模型参数猜测副作用 |
-| 多工具调度 | 连续读段并发，副作用串行 | 保留模型顺序并获得安全并发 |
-| 并发实现 | `asyncio` 任务组并跟踪任务结果 | 取消时可回收并补齐取消结果 |
-| 结果顺序 | 始终等于调用顺序 | 保证双 Provider 历史确定 |
-| 历史粒度 | 完整工具批次为检查点 | 每个助手工具调用都有对应结果 |
-| 迭代上限 | 默认 10，内部可注入 | 满足安全兜底，不改 YAML |
-| 未知工具 | 连续两轮纯未知后停止 | 允许一次自我纠正，避免无效循环 |
-| Plan 边界 | 独立只读注册中心视图 | 未开放工具无法调度 |
-| Plan 指令 | 包装为模型可见用户指令 | 不扩展两种 Provider 的 system message 契约 |
-| `/do` | 消费最近成功计划并切回 Normal | 防止重复执行，模式明确 |
-| Token 累计 | 缺失值向累计传播 | 不把部分统计伪装成准确总量 |
-| 错误处理 | 可预期停止转换为事件 | TUI 不承担循环决策 |
-| Provider 重试 | 不自动重试 | 避免重复副作用并遵守 Spec |
-| TUI 记录 | 每次模型迭代独立记录 | 保持文本、工具和调整的真实顺序 |
-| 文档证据 | 自动化 + tmux 后填写 002 | 只记录实际验收结果 |
+| Agent 与 Provider 边界 | 不可变 PromptEnvelope | 缓存、动态提醒和历史不靠位置约定或 Provider 重复推断 |
+| 模块排序 | 显式数值优先级，重复即拒绝 | 顺序确定，也允许以后插入新模块 |
+| 稳定提示生命周期 | Builder 实例内只构建一次 | 避免环境或迭代状态污染缓存前缀 |
+| 动态消息数量 | 当前每次请求恰好一个 system reminder | 避免兼容服务对多个动态 system 消息行为不一致 |
+| 标签安全 | XML 文本转义 | 自定义内容无法伪造闭合标签或改变模块边界 |
+| 环境刷新 | 每次 Provider 请求重新采集 | 工具执行后 Git dirty 状态及时变化，但不进入稳定前缀 |
+| Git 读取 | 参数数组、1 秒超时、有界输出 | 不经 Shell，不保存文件列表，不无限阻塞 |
+| PromptOptions 更新 | 无活动 Run 时原子替换 | 一次 Run 内提示一致，失败不留下半更新状态 |
+| Anthropic 缓存 | 最后工具和稳定 system 各设 ephemeral breakpoint | 分别覆盖稳定工具和七模块提示 |
+| Anthropic TTL | 协议默认 ephemeral | 不增加配置、保活请求或供应商策略表面 |
+| OpenAI 缓存 | 自动 Prompt Cache | Chat Completions 没有相同的显式断点契约 |
+| OpenAI 系统角色 | 两条 `system` | 保持当前 Chat Completions 和兼容服务范围 |
+| Plan/Normal 工具缓存 | 两套独立稳定前缀 | 不为缓存向 Plan 暴露副作用工具 |
+| 输入 Token 语义 | Provider 总输入，缓存作为明细 | 不破坏 total_tokens、TUI 和累计，也不重复计数 |
+| 缺失缓存字段 | `None` 并独立传播 | 区分零命中与服务未提供数据 |
+| 可选内容边界 | 单项 16 KiB、可选 28 KiB、总计 32 KiB | 阻止无界增长并为环境标签留空间 |
+| 提示构建取消 | Runner 包装 Pipeline 任务 | Prompt 层不依赖 AgentRunControl，避免循环导入 |
+| 环境失败 | 降级为 unknown | 环境信息不是模型请求的前置条件 |
+| 工具规则 | 只强化描述 | 符合提高遵守率目标，不扩大执行契约 |
+| 自动化测试 | 假 Provider、假 usage、临时 Git | 稳定、无费用、无网络依赖 |
+| 真实缓存验证 | 独立脚本、固定请求数、不打印正文 | 控制费用并保护密钥 |
+| 缓存门槛 | 验证生产提示，不添加 padding | 不能用测试填充制造命中 |
+| OpenAI 实测 | 命中则记录，缺失则 unknown | 兼容服务差异不阻塞整体验收 |
+| 人工质量评估 | 固定夹具与记录表，不评分 | 保持为定性评估，不提前引入自动评估系统 |
 
-## 关键权衡
+## Spec 覆盖检查
 
-- 慢事件消费者会降低 Provider 流读取速度，但避免无界事件缓冲。
-- Plan 指令进入模型历史会使模型看到的文本与 TUI 原始命令不同，但保持协议简单。
-- 工具执行中取消会补齐取消结果，因此历史比整批丢弃更完整；副作用仍不回滚。
-- 只读注册中心是模式能力范围，不扩展成通用权限系统。
-- 兼容端点不返回 usage 时显示未知，不做 tokenizer 估算。
-
-## Spec 覆盖
-
-| Spec 范围 | 设计归属 |
+| 需求范围 | 设计归属 |
 |---|---|
-| F1-F6：循环与停止 | AgentRunner、AgentRunControl、停止状态机 |
-| F7-F9：事件与双路收集 | ProviderEvent、AgentEvent、StreamCollector |
-| F10-F13：多工具与确认 | ToolExecutionPolicy、ToolScheduler、ToolExecutor |
-| F14-F18：Plan Mode | ChatSession、只读注册中心、模式事件 |
-| F19：Token 用量 | 双 Provider、TokenUsage、AgentRunner 累计 |
-| F20-F23：历史与快速路径 | HistorySink、检查点算法、AgentRunner |
-| F24：双 Provider 一致性 | Provider 适配测试与共享领域场景 |
-| N1-N16 | 单向依赖、有界异步执行、兼容测试、tmux 验收和双文档流程 |
+| F1、F2、F3、F4、F5 | PromptSection、固定 sections、Builder、PromptOptions |
+| F6、F7、F8、F9 | SupplementBuilder、ReminderScheduler、EnvironmentSnapshot、Session |
+| F10、F11、F12 | 固定工具模块、六个 ToolDefinition、稳定 Registry |
+| F13、F14 | Anthropic/OpenAI Provider 映射 |
+| F15、F16 | TokenUsage、ProviderEvent、UsageSnapshot |
+| F17 | Envelope 历史转换、thinking 与 Agent Loop 回归 |
+| F18 | 有界真实缓存验证脚本 |
+| F19 | 固定人工场景文档与夹具 |
+| N1、N2、N3、N4、N5 | 分层依赖、稳定前缀、边界校验、敏感信息和协议隔离 |
+| N6、N7、N8、N9、N10 | 缺失值、环境容错、配置兼容、行为回归和自动化测试 |
+| N11、N12、N13、N14、N15 | 真实缓存成本、人工评估、tmux、003 文档和扩展插槽 |
 
-技术设计没有未归属的 Spec 需求，模块依赖保持单向，Provider、调度器和 TUI 之间不存在循环依赖。
+模块依赖保持单向：
+
+```text
+prompting → models + tools 类型
+providers → prompting + models + tools
+agent → prompting + providers + tools
+session → agent + prompting
+cli → 组装全部组件
+tui → session + AgentEvent
+```
+
+`prompting` 不导入 Session、Provider、Runner 或 TUI，避免循环依赖。
