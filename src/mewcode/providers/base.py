@@ -1,10 +1,10 @@
 """Provider 公共接口和常量。"""
 
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator
 from typing import Protocol, runtime_checkable
 
-from mewcode.models import ChatMessage, ProviderEvent
-from mewcode.tools.base import ToolDefinition
+from mewcode.models import ProviderEvent
+from mewcode.prompting.models import PromptEnvelope
 
 DEFAULT_MAX_TOKENS = 4096
 THINKING_MAX_TOKENS = 8192
@@ -17,8 +17,7 @@ class LLMProvider(Protocol):
 
     def stream(
         self,
-        messages: Sequence[ChatMessage],
-        tools: Sequence[ToolDefinition] = (),
+        request: PromptEnvelope,
     ) -> AsyncIterator[ProviderEvent]:
         """返回统一的异步流事件。"""
         ...

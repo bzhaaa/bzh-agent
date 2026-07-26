@@ -19,12 +19,13 @@ from mewcode.models import (
     ToolResultMessage,
     UserMessage,
 )
+from mewcode.prompting.models import PromptEnvelope
 from mewcode.providers.base import (
     DEFAULT_MAX_TOKENS,
     THINKING_BUDGET_TOKENS,
     THINKING_MAX_TOKENS,
 )
-from mewcode.tools.base import ToolCall, ToolDefinition
+from mewcode.tools.base import ToolCall
 
 
 class AnthropicProvider:
@@ -90,23 +91,35 @@ class AnthropicProvider:
 
     def _request_arguments(
         self,
-        messages: Sequence[ChatMessage],
-        tools: Sequence[ToolDefinition] = (),
+        envelope: PromptEnvelope,
     ) -> dict[str, Any]:
         arguments: dict[str, Any] = {
             "model": self.profile.model,
-            "messages": self._messages(messages),
+            "messages": self._messages(envelope.messages),
             "max_tokens": DEFAULT_MAX_TOKENS,
+            "system": [
+                {
+                    "type": "text",
+                    "text": envelope.prompt.stable_system,
+                    "cache_control": {"type": "ephemeral"},
+                },
+                *(
+                    {"type": "text", "text": supplement}
+                    for supplement in envelope.prompt.supplements
+                ),
+            ],
         }
-        if tools:
-            arguments["tools"] = [
+        if envelope.tools:
+            tools = [
                 {
                     "name": tool.name,
                     "description": tool.description,
                     "input_schema": tool.input_schema,
                 }
-                for tool in tools
+                for tool in envelope.tools
             ]
+            tools[-1]["cache_control"] = {"type": "ephemeral"}
+            arguments["tools"] = tools
         if self.profile.thinking:
             arguments["max_tokens"] = THINKING_MAX_TOKENS
             arguments["thinking"] = {
@@ -122,8 +135,7 @@ class AnthropicProvider:
 
     async def stream(
         self,
-        messages: Sequence[ChatMessage],
-        tools: Sequence[ToolDefinition] = (),
+        envelope: PromptEnvelope,
     ) -> AsyncIterator[ProviderEvent]:
         """发起请求并逐个产生统一事件。"""
 
@@ -133,9 +145,11 @@ class AnthropicProvider:
         calls: dict[int, dict[str, object]] = {}
         input_tokens: int | None = None
         output_tokens: int | None = None
+        cache_creation_input_tokens: int | None = None
+        cache_read_input_tokens: int | None = None
         saw_usage = False
         try:
-            manager = self.client.messages.stream(**self._request_arguments(messages, tools))
+            manager = self.client.messages.stream(**self._request_arguments(envelope))
             async with manager as stream:
                 async for event in stream:
                     event_type = getattr(event, "type", None)
@@ -145,18 +159,24 @@ class AnthropicProvider:
                         raw_usage = getattr(getattr(event, "message", None), "usage", None)
                         if raw_usage is not None:
                             regular = getattr(raw_usage, "input_tokens", None)
-                            cache_creation = getattr(raw_usage, "cache_creation_input_tokens", 0)
-                            cache_read = getattr(raw_usage, "cache_read_input_tokens", 0)
+                            cache_creation = getattr(raw_usage, "cache_creation_input_tokens", None)
+                            cache_read = getattr(raw_usage, "cache_read_input_tokens", None)
                             if not all(
-                                value is None or isinstance(value, int) and value >= 0
+                                value is None
+                                or isinstance(value, int)
+                                and not isinstance(value, bool)
+                                and value >= 0
                                 for value in (regular, cache_creation, cache_read)
                             ):
                                 raise ProviderError(ProviderErrorKind.INVALID_STREAM)
-                            input_tokens = (
-                                None
-                                if regular is None
-                                else regular + (cache_creation or 0) + (cache_read or 0)
-                            )
+                            cache_creation_input_tokens = cache_creation
+                            cache_read_input_tokens = cache_read
+                            if regular is None:
+                                input_tokens = None
+                            elif cache_creation is not None and cache_read is not None:
+                                input_tokens = regular + cache_creation + cache_read
+                            else:
+                                input_tokens = regular
                             saw_usage = True
                         continue
                     if event_type == "message_stop":
@@ -171,7 +191,9 @@ class AnthropicProvider:
                         raw_usage = getattr(event, "usage", None)
                         if raw_usage is not None:
                             value = getattr(raw_usage, "output_tokens", None)
-                            if value is not None and (not isinstance(value, int) or value < 0):
+                            if value is not None and (
+                                not isinstance(value, int) or isinstance(value, bool) or value < 0
+                            ):
                                 raise ProviderError(ProviderErrorKind.INVALID_STREAM)
                             if output_tokens is not None and value is not None:
                                 raise ProviderError(ProviderErrorKind.INVALID_STREAM)
@@ -273,6 +295,11 @@ class AnthropicProvider:
         if saw_usage:
             yield ProviderEvent(
                 ProviderEventKind.TOKEN_USAGE,
-                usage=TokenUsage(input_tokens, output_tokens),
+                usage=TokenUsage(
+                    input_tokens,
+                    output_tokens,
+                    cache_creation_input_tokens,
+                    cache_read_input_tokens,
+                ),
             )
         yield ProviderEvent(ProviderEventKind.DONE)

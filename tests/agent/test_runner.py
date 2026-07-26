@@ -23,6 +23,7 @@ from mewcode.models import (
     TokenUsage,
     UserMessage,
 )
+from mewcode.prompting import PromptEnvelope, PromptPipeline
 from mewcode.tools import (
     ToolCall,
     ToolContext,
@@ -37,10 +38,12 @@ class QueueProvider:
         self.rounds = rounds
         self.requests: list[tuple[ChatMessage, ...]] = []
         self.tool_names: list[tuple[str, ...]] = []
+        self.envelopes: list[PromptEnvelope] = []
 
-    async def stream(self, messages, tools=()) -> AsyncIterator[ProviderEvent]:
-        self.requests.append(tuple(messages))
-        self.tool_names.append(tuple(tool.name for tool in tools))
+    async def stream(self, request: PromptEnvelope) -> AsyncIterator[ProviderEvent]:
+        self.envelopes.append(request)
+        self.requests.append(request.messages)
+        self.tool_names.append(tuple(tool.name for tool in request.tools))
         for item in self.rounds.pop(0):
             if isinstance(item, Exception):
                 raise item
@@ -114,6 +117,7 @@ def build_runner(provider: QueueProvider, tmp_path: Path):
         ToolScheduler(registry, executor),  # type: ignore[arg-type]
         ToolScheduler(readonly, executor),  # type: ignore[arg-type]
         ToolContext(tmp_path),
+        PromptPipeline(),
     )
     return runner, executor
 
@@ -125,7 +129,7 @@ async def run_events(runner: AgentRunner, sink: Sink, *, maximum: int = 10):
         AgentMode.NORMAL,
         AgentRunControl(),
         sink,
-        maximum,
+        max_iterations=maximum,
     )
     return [event async for event in runner.run(request)]
 
@@ -236,7 +240,7 @@ async def test_cancel_during_model_stream_discards_partial_response(tmp_path: Pa
     started = asyncio.Event()
 
     class BlockingProvider:
-        async def stream(self, _messages, _tools=()) -> AsyncIterator[ProviderEvent]:
+        async def stream(self, _request: PromptEnvelope) -> AsyncIterator[ProviderEvent]:
             yield ProviderEvent(ProviderEventKind.TEXT_DELTA, "部分")
             started.set()
             await asyncio.Event().wait()
@@ -249,6 +253,7 @@ async def test_cancel_during_model_stream_discards_partial_response(tmp_path: Pa
         ToolScheduler(registry, executor),  # type: ignore[arg-type]
         ToolScheduler(readonly, executor),  # type: ignore[arg-type]
         ToolContext(tmp_path),
+        PromptPipeline(),
     )
     sink = Sink()
     control = AgentRunControl()
@@ -284,6 +289,7 @@ async def test_cancel_during_tools_commits_cancelled_checkpoint(tmp_path: Path) 
         ToolScheduler(registry, executor),  # type: ignore[arg-type]
         ToolScheduler(readonly, executor),  # type: ignore[arg-type]
         ToolContext(tmp_path),
+        PromptPipeline(),
     )
     sink = Sink()
     control = AgentRunControl()

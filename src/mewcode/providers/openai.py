@@ -19,8 +19,9 @@ from mewcode.models import (
     ToolResultMessage,
     UserMessage,
 )
+from mewcode.prompting.models import PromptEnvelope
 from mewcode.providers.base import DEFAULT_MAX_TOKENS
-from mewcode.tools.base import ToolCall, ToolDefinition
+from mewcode.tools.base import ToolCall
 
 
 class OpenAIProvider:
@@ -73,8 +74,7 @@ class OpenAIProvider:
 
     async def stream(
         self,
-        messages: Sequence[ChatMessage],
-        tools: Sequence[ToolDefinition] = (),
+        envelope: PromptEnvelope,
     ) -> AsyncIterator[ProviderEvent]:
         """发起请求并逐个产生统一事件。"""
 
@@ -87,12 +87,19 @@ class OpenAIProvider:
         try:
             request: dict[str, object] = {
                 "model": self.profile.model,
-                "messages": self._messages(messages),
+                "messages": [
+                    {"role": "system", "content": envelope.prompt.stable_system},
+                    *(
+                        {"role": "system", "content": supplement}
+                        for supplement in envelope.prompt.supplements
+                    ),
+                    *self._messages(envelope.messages),
+                ],
                 "max_tokens": DEFAULT_MAX_TOKENS,
                 "stream": True,
                 "stream_options": {"include_usage": True},
             }
-            if tools:
+            if envelope.tools:
                 request["tools"] = [
                     {
                         "type": "function",
@@ -102,7 +109,7 @@ class OpenAIProvider:
                             "parameters": tool.input_schema,
                         },
                     }
-                    for tool in tools
+                    for tool in envelope.tools
                 ]
                 request["tool_choice"] = "auto"
             stream = await self.client.chat.completions.create(**request)
@@ -116,12 +123,25 @@ class OpenAIProvider:
                         raise ProviderError(ProviderErrorKind.INVALID_STREAM)
                     input_tokens = getattr(raw_usage, "prompt_tokens", None)
                     output_tokens = getattr(raw_usage, "completion_tokens", None)
+                    raw_details = getattr(raw_usage, "prompt_tokens_details", None)
+                    if isinstance(raw_details, dict):
+                        cached_tokens = raw_details.get("cached_tokens")
+                    else:
+                        cached_tokens = getattr(raw_details, "cached_tokens", None)
                     if not all(
-                        value is None or isinstance(value, int) and value >= 0
-                        for value in (input_tokens, output_tokens)
+                        value is None
+                        or isinstance(value, int)
+                        and not isinstance(value, bool)
+                        and value >= 0
+                        for value in (input_tokens, output_tokens, cached_tokens)
                     ):
                         raise ProviderError(ProviderErrorKind.INVALID_STREAM)
-                    usage = TokenUsage(input_tokens, output_tokens)
+                    usage = TokenUsage(
+                        input_tokens,
+                        output_tokens,
+                        cache_creation_input_tokens=None,
+                        cache_read_input_tokens=cached_tokens,
+                    )
                 for choice in choices:
                     if getattr(choice, "index", 0) != 0:
                         raise ProviderError(ProviderErrorKind.INVALID_STREAM)

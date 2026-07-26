@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import inspect
+import asyncio
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
 from mewcode.agent.collector import StreamCollector
-from mewcode.agent.control import AgentRunCancelled, AgentRunControl
+from mewcode.agent.control import AgentRunCancelled, AgentRunControl, wait_with_control
 from mewcode.agent.events import (
     AgentEvent,
     AgentEventKind,
@@ -26,6 +26,7 @@ from mewcode.models import (
     ToolResultMessage,
     UserMessage,
 )
+from mewcode.prompting import PromptOptions, PromptPipeline
 from mewcode.providers.base import LLMProvider
 from mewcode.tools.base import ToolContext
 from mewcode.tools.errors import ToolErrorCode
@@ -44,6 +45,7 @@ class AgentRunRequest:
     mode: AgentMode
     control: AgentRunControl
     history_sink: HistorySink
+    prompt_options: PromptOptions = PromptOptions()
     max_iterations: int = DEFAULT_MAX_ITERATIONS
 
 
@@ -54,17 +56,13 @@ class AgentRunner:
         normal_scheduler: ToolScheduler,
         plan_scheduler: ToolScheduler,
         context: ToolContext,
+        prompt_pipeline: PromptPipeline,
     ) -> None:
         self.provider = provider
         self.normal_scheduler = normal_scheduler
         self.plan_scheduler = plan_scheduler
         self.context = context
-
-    def _provider_stream(self, messages: Sequence[ChatMessage], scheduler: ToolScheduler):
-        parameters = inspect.signature(self.provider.stream).parameters
-        if len(parameters) >= 2:
-            return self.provider.stream(messages, scheduler.registry.definitions())
-        return self.provider.stream(messages)
+        self.prompt_pipeline = prompt_pipeline
 
     @staticmethod
     def _event(
@@ -82,7 +80,7 @@ class AgentRunner:
         history = list(request.history)
         user_pending = True
         unknown_streak = 0
-        cumulative = TokenUsage(0, 0)
+        cumulative = TokenUsage(0, 0, 0, 0)
 
         for iteration in range(1, request.max_iterations + 1):
             if request.control.is_cancelled():
@@ -109,11 +107,24 @@ class AgentRunner:
                 control=request.control,
             )
             try:
-                async for event in collector.consume(self._provider_stream(candidate, scheduler)):
+                envelope = await wait_with_control(
+                    asyncio.create_task(
+                        self.prompt_pipeline.build(
+                            messages=candidate,
+                            tools=scheduler.registry.definitions(),
+                            project_root=self.context.project_root,
+                            mode=request.mode,
+                            iteration=iteration,
+                            options=request.prompt_options,
+                        )
+                    ),
+                    request.control,
+                )
+                async for event in collector.consume(self.provider.stream(envelope)):
                     yield event
                 response = collector.response
             except AgentRunCancelled:
-                unknown = TokenUsage(None, None)
+                unknown = TokenUsage(None, None, None, None)
                 cumulative = cumulative.accumulate(unknown)
                 yield self._event(
                     AgentEventKind.TOKEN_USAGE,

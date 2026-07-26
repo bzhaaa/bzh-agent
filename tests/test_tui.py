@@ -1,7 +1,7 @@
 """Textual 全屏 TUI 测试。"""
 
 import asyncio
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator
 from io import StringIO
 from pathlib import Path
 
@@ -13,6 +13,7 @@ from textual.widgets import Markdown, Static
 from mewcode.agent import AgentMode
 from mewcode.errors import ProviderError, ProviderErrorKind
 from mewcode.models import ChatMessage, ProviderEvent, ProviderEventKind, TokenUsage
+from mewcode.prompting import PromptEnvelope
 from mewcode.session import ChatSession
 from mewcode.tools import CommandApprovalRequest, ToolCall, ToolContext, ToolResult
 from mewcode.tui import (
@@ -34,8 +35,8 @@ class QueueProvider:
         self.rounds = rounds
         self.requests: list[tuple[ChatMessage, ...]] = []
 
-    async def stream(self, messages: Sequence[ChatMessage]) -> AsyncIterator[ProviderEvent]:
-        self.requests.append(tuple(messages))
+    async def stream(self, request: PromptEnvelope) -> AsyncIterator[ProviderEvent]:
+        self.requests.append(request.messages)
         for item in self.rounds.pop(0):
             if isinstance(item, BaseException):
                 raise item
@@ -48,8 +49,8 @@ class BlockingProvider:
         self.started = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def stream(self, messages: Sequence[ChatMessage]) -> AsyncIterator[ProviderEvent]:
-        self.requests.append(tuple(messages))
+    async def stream(self, request: PromptEnvelope) -> AsyncIterator[ProviderEvent]:
+        self.requests.append(request.messages)
         yield ProviderEvent(ProviderEventKind.TEXT_DELTA, "部分")
         self.started.set()
         await self.release.wait()

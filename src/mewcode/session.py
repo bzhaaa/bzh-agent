@@ -15,6 +15,7 @@ from mewcode.agent import (
 from mewcode.agent.runner import DEFAULT_MAX_ITERATIONS, AgentRunner, AgentRunRequest
 from mewcode.agent.scheduler import ToolScheduler
 from mewcode.models import ChatMessage, UserMessage
+from mewcode.prompting import PromptOptions, PromptPipeline
 from mewcode.providers import LLMProvider
 from mewcode.tools import ToolContext, ToolExecutor, ToolRegistry, create_default_registry
 
@@ -32,6 +33,7 @@ class ChatSession:
         context: ToolContext | None = None,
         *,
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
+        prompt_options: PromptOptions | None = None,
     ) -> None:
         if isinstance(runner, AgentRunner):
             self.runner = runner
@@ -45,6 +47,7 @@ class ChatSession:
                 ToolScheduler(all_tools, all_executor),
                 ToolScheduler(readonly, ToolExecutor(readonly)),
                 run_context,
+                PromptPipeline(),
             )
         self.context = self.runner.context
         self.max_iterations = max_iterations
@@ -52,6 +55,9 @@ class ChatSession:
         self._mode = AgentMode.NORMAL
         self._plan_ready = False
         self._current: AgentRunControl | None = None
+        initial_options = prompt_options or PromptOptions()
+        self._prompt_options = initial_options
+        self.runner.prompt_pipeline.validate_options(initial_options)
 
     @property
     def history(self) -> tuple[ChatMessage, ...]:
@@ -65,33 +71,24 @@ class ChatSession:
     def plan_ready(self) -> bool:
         return self._plan_ready
 
+    @property
+    def prompt_options(self) -> PromptOptions:
+        return self._prompt_options
+
+    def set_prompt_options(self, options: PromptOptions) -> None:
+        """在没有活动 Run 时原子替换动态提示选项。"""
+
+        if self._current is not None:
+            raise RuntimeError("Agent Run 进行中，不能更新提示选项。")
+        self.runner.prompt_pipeline.validate_options(options)
+        self._prompt_options = options
+
     async def commit(self, messages: Sequence[ChatMessage]) -> None:
         self._history.extend(messages)
 
     def cancel_current(self) -> None:
         if self._current is not None:
             self._current.cancel()
-
-    @staticmethod
-    def _plan_instruction(task: str) -> str:
-        return (
-            "你现在处于只读 Plan Mode。只能调查项目并形成可执行计划，"
-            "不得修改文件或执行命令。\n\n用户任务：\n" + task
-        )
-
-    @staticmethod
-    def _plan_followup(message: str) -> str:
-        return (
-            "继续在只读 Plan Mode 中调查并更新计划。不得修改文件或执行命令。"
-            "\n\n用户补充：\n" + message
-        )
-
-    @staticmethod
-    def _do_instruction() -> str:
-        return (
-            "退出 Plan Mode。请根据当前对话中已经完成的任务调查与计划开始执行，"
-            "自主使用可用工具，直到任务完成。"
-        )
 
     async def stream_reply(self, user_input: str) -> AsyncIterator[AgentEvent]:
         if self._current is not None:
@@ -119,7 +116,7 @@ class ChatSession:
                 return
             self._mode = AgentMode.PLAN
             self._plan_ready = False
-            model_input = self._plan_instruction(task)
+            model_input = task
             mode_event = AgentEvent(AgentEventKind.MODE_CHANGED, mode=self._mode)
         elif stripped == "/do":
             if not self._plan_ready:
@@ -132,10 +129,10 @@ class ChatSession:
                 return
             self._plan_ready = False
             self._mode = AgentMode.NORMAL
-            model_input = self._do_instruction()
+            model_input = "/do"
             mode_event = AgentEvent(AgentEventKind.MODE_CHANGED, mode=self._mode)
         elif self._mode == AgentMode.PLAN:
-            model_input = self._plan_followup(user_input)
+            model_input = user_input
             self._plan_ready = False
         else:
             model_input = user_input
@@ -152,6 +149,7 @@ class ChatSession:
                 mode=self._mode,
                 control=control,
                 history_sink=self,
+                prompt_options=self._prompt_options,
                 max_iterations=self.max_iterations,
             )
             async for event in self.runner.run(request):

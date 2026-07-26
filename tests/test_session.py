@@ -14,6 +14,7 @@ from mewcode.models import (
     ProviderEventKind,
     UserMessage,
 )
+from mewcode.prompting import PromptBuildError, PromptEnvelope, PromptOptions
 from mewcode.session import ChatSession
 from mewcode.tools import ToolCall, ToolContext, ToolErrorCode, ToolResult
 
@@ -23,10 +24,12 @@ class QueueProvider:
         self.rounds = rounds
         self.requests: list[tuple[ChatMessage, ...]] = []
         self.tool_names: list[tuple[str, ...]] = []
+        self.envelopes: list[PromptEnvelope] = []
 
-    async def stream(self, messages, tools=()) -> AsyncIterator[ProviderEvent]:
-        self.requests.append(tuple(messages))
-        self.tool_names.append(tuple(tool.name for tool in tools))
+    async def stream(self, request: PromptEnvelope) -> AsyncIterator[ProviderEvent]:
+        self.envelopes.append(request)
+        self.requests.append(request.messages)
+        self.tool_names.append(tuple(tool.name for tool in request.tools))
         for item in self.rounds.pop(0):
             if isinstance(item, Exception):
                 raise item
@@ -101,7 +104,8 @@ async def test_plan_stays_readonly_and_do_switches_to_all_tools(tmp_path: Path) 
         ("read_file", "find_files", "search_code"),
     ]
     assert isinstance(provider.requests[0][-1], UserMessage)
-    assert "只读 Plan Mode" in provider.requests[0][-1].content
+    assert provider.requests[0][-1].content == "调查并修改"
+    assert "当前为 Plan Mode" in provider.envelopes[0].prompt.supplements[0]
 
     do_events = await collect(session, "/do")
     assert do_events[0].kind == AgentEventKind.MODE_CHANGED
@@ -109,6 +113,8 @@ async def test_plan_stays_readonly_and_do_switches_to_all_tools(tmp_path: Path) 
     assert session.mode == AgentMode.NORMAL
     assert not session.plan_ready
     assert len(provider.tool_names[2]) == 6
+    assert provider.requests[2][-1] == UserMessage("/do")
+    assert "当前为 Normal Mode" in provider.envelopes[2].prompt.supplements[0]
     assert [call.name for call in executor.calls] == ["write_file"]
 
 
@@ -122,7 +128,8 @@ async def test_plan_followup_remains_readonly(tmp_path: Path) -> None:
     assert session.mode == AgentMode.PLAN
     assert session.plan_ready
     assert provider.tool_names[-1] == ("read_file", "find_files", "search_code")
-    assert "继续在只读 Plan Mode" in provider.requests[-1][-1].content
+    assert provider.requests[-1][-1].content == "请直接写文件"
+    assert "保持只读" in provider.envelopes[-1].prompt.supplements[0]
 
 
 @pytest.mark.asyncio
@@ -178,7 +185,7 @@ async def test_cancel_current_and_reject_parallel_run(tmp_path: Path) -> None:
     started = asyncio.Event()
 
     class BlockingProvider:
-        async def stream(self, _messages, _tools=()) -> AsyncIterator[ProviderEvent]:
+        async def stream(self, _request: PromptEnvelope) -> AsyncIterator[ProviderEvent]:
             yield ProviderEvent(ProviderEventKind.TEXT_DELTA, "部分")
             started.set()
             await asyncio.Event().wait()
@@ -197,3 +204,14 @@ async def test_cancel_current_and_reject_parallel_run(tmp_path: Path) -> None:
     events = await task
     assert events[-1].stop_reason == AgentStopReason.CANCELLED
     assert session.history == ()
+
+
+def test_prompt_options_update_is_atomic_and_validated(tmp_path: Path) -> None:
+    provider = QueueProvider([])
+    session = ChatSession(provider, context=ToolContext(tmp_path))
+    valid = PromptOptions(custom_instructions="保持聚焦")
+    session.set_prompt_options(valid)
+    assert session.prompt_options == valid
+    with pytest.raises(PromptBuildError):
+        session.set_prompt_options(PromptOptions(custom_instructions="x" * 20_000))
+    assert session.prompt_options == valid

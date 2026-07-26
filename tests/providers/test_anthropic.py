@@ -20,6 +20,7 @@ from mewcode.models import (
     ToolResultMessage,
     UserMessage,
 )
+from mewcode.prompting import PromptEnvelope, StructuredPrompt
 from mewcode.providers.anthropic import AnthropicProvider
 from mewcode.tools import ToolCall, ToolDefinition, ToolResult
 
@@ -65,6 +66,14 @@ def make_profile(thinking: bool = False) -> ProviderProfile:
     )
 
 
+def envelope(messages, tools=()) -> PromptEnvelope:
+    return PromptEnvelope(
+        StructuredPrompt("稳定系统提示", ("<system-reminder>动态提醒</system-reminder>",)),
+        tuple(messages),
+        tuple(tools),
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "thinking,max_tokens,thinking_config",
@@ -86,7 +95,7 @@ async def test_anthropic_request_and_stream_events(
     ]
     messages = FakeMessages(events)
     provider = AnthropicProvider(make_profile(thinking), SimpleNamespace(messages=messages))
-    result = [event async for event in provider.stream([ChatMessage("user", "问")])]
+    result = [event async for event in provider.stream(envelope([ChatMessage("user", "问")]))]
     assert [event.kind for event in result] == [
         ProviderEventKind.THINKING_DELTA,
         ProviderEventKind.TEXT_DELTA,
@@ -96,6 +105,14 @@ async def test_anthropic_request_and_stream_events(
     assert messages.arguments["model"] == "claude-test"
     assert messages.arguments["max_tokens"] == max_tokens
     assert messages.arguments["messages"] == [{"role": "user", "content": "问"}]
+    assert messages.arguments["system"] == [
+        {
+            "type": "text",
+            "text": "稳定系统提示",
+            "cache_control": {"type": "ephemeral"},
+        },
+        {"type": "text", "text": "<system-reminder>动态提醒</system-reminder>"},
+    ]
     assert messages.arguments.get("thinking") == thinking_config
 
 
@@ -104,7 +121,7 @@ async def test_anthropic_rejects_empty_text_stream() -> None:
     messages = FakeMessages([SimpleNamespace(type="message_start")])
     provider = AnthropicProvider(make_profile(), SimpleNamespace(messages=messages))
     with pytest.raises(ProviderError) as caught:
-        _ = [event async for event in provider.stream([ChatMessage("user", "问")])]
+        _ = [event async for event in provider.stream(envelope([ChatMessage("user", "问")]))]
     assert caught.value.kind == ProviderErrorKind.INVALID_STREAM
 
 
@@ -149,7 +166,7 @@ data: {"type":"message_stop"}
     )
     provider = AnthropicProvider(make_profile(thinking=True), client)
     try:
-        result = [event async for event in provider.stream([ChatMessage("user", "问")])]
+        result = [event async for event in provider.stream(envelope([ChatMessage("user", "问")]))]
     finally:
         await provider.close()
     assert [(event.kind, event.delta) for event in result] == [
@@ -179,7 +196,7 @@ async def test_anthropic_maps_status_errors(exception_type, expected_kind) -> No
 
     provider = AnthropicProvider(make_profile(), SimpleNamespace(messages=RaisingMessages()))
     with pytest.raises(ProviderError) as caught:
-        _ = [event async for event in provider.stream([ChatMessage("user", "问")])]
+        _ = [event async for event in provider.stream(envelope([ChatMessage("user", "问")]))]
     assert caught.value.kind == expected_kind
     assert "unsafe-secret" not in str(caught.value)
 
@@ -213,13 +230,14 @@ async def test_anthropic_collects_fragmented_tool_call_after_message_stop() -> N
         "读取文件",
         {"type": "object", "properties": {}, "additionalProperties": False},
     )
-    result = [event async for event in provider.stream([UserMessage("问")], [definition])]
+    result = [event async for event in provider.stream(envelope([UserMessage("问")], [definition]))]
     assert [event.kind for event in result] == [
         ProviderEventKind.TOOL_CALL,
         ProviderEventKind.DONE,
     ]
     assert result[0].tool_call == ToolCall("tool-1", "read_file", '{"path":"a.txt"}')
     assert messages.arguments["tools"][0]["input_schema"]["type"] == "object"
+    assert messages.arguments["tools"][0]["cache_control"] == {"type": "ephemeral"}
 
 
 def test_anthropic_converts_and_merges_tool_results() -> None:
@@ -257,7 +275,7 @@ async def test_anthropic_rejects_unclosed_tool_block() -> None:
     ]
     provider = AnthropicProvider(make_profile(), SimpleNamespace(messages=FakeMessages(events)))
     with pytest.raises(ProviderError) as caught:
-        _ = [event async for event in provider.stream([UserMessage("问")])]
+        _ = [event async for event in provider.stream(envelope([UserMessage("问")]))]
     assert caught.value.kind == ProviderErrorKind.INVALID_STREAM
 
 
@@ -289,9 +307,9 @@ async def test_anthropic_usage_includes_cache_tokens() -> None:
         make_profile(),
         SimpleNamespace(messages=FakeMessages(events)),
     )
-    result = [event async for event in provider.stream([UserMessage("问")])]
+    result = [event async for event in provider.stream(envelope([UserMessage("问")]))]
     usage = next(event.usage for event in result if event.usage is not None)
-    assert usage == TokenUsage(9, 5)
+    assert usage == TokenUsage(9, 5, 3, 4)
 
 
 @pytest.mark.asyncio
@@ -331,6 +349,6 @@ async def test_anthropic_preserves_multiple_tool_block_order() -> None:
         make_profile(),
         SimpleNamespace(messages=FakeMessages(events)),
     )
-    result = [event async for event in provider.stream([UserMessage("问")])]
+    result = [event async for event in provider.stream(envelope([UserMessage("问")]))]
     calls = [event.tool_call for event in result if event.tool_call is not None]
     assert [call.id for call in calls] == ["a", "b"]

@@ -14,6 +14,7 @@ from mewcode.agent.runner import AgentRunner
 from mewcode.agent.scheduler import ToolScheduler
 from mewcode.config import ProviderProfile, load_config
 from mewcode.errors import ConfigError
+from mewcode.prompting import PromptPipeline
 from mewcode.providers import create_provider
 from mewcode.session import READ_ONLY_TOOLS, ChatSession
 from mewcode.tools import CommandApprovalRequest, ToolContext, ToolExecutor, create_default_registry
@@ -53,6 +54,7 @@ async def run_app(profile: ProviderProfile, console: Console | None = None) -> N
             ToolScheduler(registry, executor),
             ToolScheduler(readonly_registry, ToolExecutor(readonly_registry)),
             context,
+            PromptPipeline(),
         )
         session = ChatSession(runner)
         app = MewCodeApp(session, profile_name=profile.name, model=profile.model)

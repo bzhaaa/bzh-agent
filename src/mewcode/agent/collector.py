@@ -113,8 +113,14 @@ class StreamCollector:
                     ):
                         raise self._invalid()
                     if any(
-                        value is not None and value < 0
-                        for value in (event.usage.input_tokens, event.usage.output_tokens)
+                        value is not None
+                        and (not isinstance(value, int) or isinstance(value, bool) or value < 0)
+                        for value in (
+                            event.usage.input_tokens,
+                            event.usage.output_tokens,
+                            event.usage.cache_creation_input_tokens,
+                            event.usage.cache_read_input_tokens,
+                        )
                     ):
                         raise self._invalid()
                     self._usage = event.usage
