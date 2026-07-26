@@ -12,6 +12,9 @@
 | 000 | 终端纯对话基础 | [000-current-features.md](000-current-features.md) | [000-claude-code-current-features.md](000-claude-code-current-features.md) |
 | 001 | 工具系统 | [001-tool-system.md](001-tool-system.md) | [001-claude-code-tool-system.md](001-claude-code-tool-system.md) |
 | 002 | Agent Loop 与 Plan Mode | [002-agent-loop.md](002-agent-loop.md) | [002-claude-code-agent-loop.md](002-claude-code-agent-loop.md) |
+| 003 | 结构化系统提示与缓存 | [003-structured-system-prompt.md](003-structured-system-prompt.md) | [003-claude-code-system-prompt.md](003-claude-code-system-prompt.md) |
+
+编号 003 的固定人工前后对比见 [003-system-prompt-scenarios.md](../evals/003-system-prompt-scenarios.md)。
 
 ## 后续新增规则
 
