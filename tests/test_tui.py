@@ -170,6 +170,20 @@ async def test_alt_enter_inserts_newline_and_height_caps_at_six() -> None:
 
 
 @pytest.mark.asyncio
+async def test_terminal_escape_enter_sequence_inserts_newline_without_submit() -> None:
+    provider = QueueProvider([])
+    app = make_app(provider)
+    async with app.run_test() as pilot:
+        composer = app.query_one(ComposerTextArea)
+        await pilot.press("甲", "escape", "enter", "乙")
+        await pilot.pause()
+        assert composer.text == "甲\n乙"
+        assert provider.requests == []
+        assert app.transcript == []
+        app.exit()
+
+
+@pytest.mark.asyncio
 async def test_generating_keeps_draft_and_blocks_submission() -> None:
     provider = BlockingProvider()
     app = make_app(provider)

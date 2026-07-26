@@ -302,16 +302,30 @@ class ComposerTextArea(TextArea):
             placeholder="输入消息",
         )
         self.logical_height = 1
+        self._escape_pending = False
+
+    def _clear_escape_pending(self) -> None:
+        self._escape_pending = False
 
     async def on_key(self, event: events.Key) -> None:
-        if event.key == "alt+enter":
+        if event.key == "escape":
+            # 部分终端和 tmux 会把 Alt+Enter 编码为连续的 Escape、Enter。
+            self._escape_pending = True
+            self.set_timer(0.1, self._clear_escape_pending)
+            event.stop()
+            event.prevent_default()
+        elif event.key == "alt+enter" or (event.key == "enter" and self._escape_pending):
+            self._escape_pending = False
             event.stop()
             event.prevent_default()
             self.insert("\n", self.cursor_location)
         elif event.key == "enter":
+            self._escape_pending = False
             event.stop()
             event.prevent_default()
             await self.app.action_submit()
+        else:
+            self._escape_pending = False
 
     def update_height(self) -> None:
         """按显式换行数把可见输入行限制在 1-6 行。"""
