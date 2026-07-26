@@ -305,3 +305,57 @@ async def test_cancel_during_tools_commits_cancelled_checkpoint(tmp_path: Path) 
     assert [message.role for message in sink.messages] == ["user", "assistant", "tool"]
     assert sink.messages[-1].result.error_code == ToolErrorCode.CANCELLED  # type: ignore[attr-defined]
     assert events[-1].stop_reason == AgentStopReason.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_prompt_reminder_frequency_follows_runner_iterations(tmp_path: Path) -> None:
+    provider = QueueProvider([tool_round(f"call-{index}") for index in range(1, 11)])
+    runner, _ = build_runner(provider, tmp_path)
+    events = await run_events(runner, Sink(), maximum=10)
+    supplements = [request.prompt.supplements[0] for request in provider.envelopes]
+    assert len(supplements) == 10
+    assert ["持续调查、执行并验证" in item for item in supplements] == [
+        True,
+        False,
+        False,
+        False,
+        False,
+        True,
+        False,
+        False,
+        False,
+        False,
+    ]
+    assert events[-1].stop_reason == AgentStopReason.ITERATION_LIMIT
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_prompt_build_skips_provider_request(tmp_path: Path) -> None:
+    started = asyncio.Event()
+
+    class BlockingPipeline:
+        async def build(self, **_kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+    provider = QueueProvider([])
+    registry = create_default_registry()
+    readonly = registry.subset(("read_file", "find_files", "search_code"))
+    executor = RecordingExecutor()
+    runner = AgentRunner(
+        provider,
+        ToolScheduler(registry, executor),  # type: ignore[arg-type]
+        ToolScheduler(readonly, executor),  # type: ignore[arg-type]
+        ToolContext(tmp_path),
+        BlockingPipeline(),  # type: ignore[arg-type]
+    )
+    control = AgentRunControl()
+    request = AgentRunRequest((), UserMessage("任务"), AgentMode.NORMAL, control, Sink())
+    task = asyncio.create_task(
+        anext(event async for event in runner.run(request) if event.kind == AgentEventKind.STOPPED)
+    )
+    await started.wait()
+    control.cancel()
+    stopped = await task
+    assert stopped.stop_reason == AgentStopReason.CANCELLED
+    assert provider.requests == []

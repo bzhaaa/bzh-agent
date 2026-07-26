@@ -258,6 +258,22 @@ def test_anthropic_converts_and_merges_tool_results() -> None:
     assert messages[2]["content"][1]["is_error"] is True
 
 
+def test_anthropic_only_marks_last_tool_as_cache_breakpoint() -> None:
+    definitions = [
+        ToolDefinition(
+            name,
+            f"{name} description",
+            {"type": "object", "properties": {}, "additionalProperties": False},
+        )
+        for name in ("read_file", "find_files")
+    ]
+    provider = AnthropicProvider(make_profile(), SimpleNamespace(messages=FakeMessages([])))
+    arguments = provider._request_arguments(envelope([UserMessage("问")], definitions))
+    tools = arguments["tools"]
+    assert "cache_control" not in tools[0]
+    assert tools[1]["cache_control"] == {"type": "ephemeral"}
+
+
 @pytest.mark.asyncio
 async def test_anthropic_rejects_unclosed_tool_block() -> None:
     events = [

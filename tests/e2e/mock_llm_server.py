@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -10,7 +11,34 @@ from pathlib import Path
 from typing import Any
 
 
-def select_calls(prompt: str, step: int) -> list[tuple[str, dict[str, object]]]:
+def select_calls(prompt: str, step: int, mode: str) -> list[tuple[str, dict[str, object]]]:
+    if mode == "plan":
+        sequence = [
+            [
+                ("read_file", {"path": "sample.txt"}),
+                ("find_files", {"pattern": "**/*.txt"}),
+            ],
+            [("search_code", {"query": "needle", "file_pattern": "**/*.txt"})],
+        ]
+        return sequence[step] if step < len(sequence) else []
+    if prompt.strip() == "/do":
+        return (
+            [("write_file", {"path": "plan-result.txt", "content": "planned\n"})]
+            if step == 0
+            else []
+        )
+    if "先读后改" in prompt:
+        sequence = [
+            [("read_file", {"path": "generated.txt"})],
+            [
+                (
+                    "edit_file",
+                    {"path": "generated.txt", "old_text": "alpha", "new_text": "beta"},
+                )
+            ],
+            [("read_file", {"path": "generated.txt"})],
+        ]
+        return sequence[step] if step < len(sequence) else []
     if "三步任务" in prompt:
         sequence = [
             [
@@ -40,21 +68,6 @@ def select_calls(prompt: str, step: int) -> list[tuple[str, dict[str, object]]]:
             ],
         ]
         return sequence[step] if step < len(sequence) else []
-    if "只读 Plan Mode" in prompt or "继续在只读 Plan Mode" in prompt:
-        sequence = [
-            [
-                ("read_file", {"path": "sample.txt"}),
-                ("find_files", {"pattern": "**/*.txt"}),
-            ],
-            [("search_code", {"query": "needle", "file_pattern": "**/*.txt"})],
-        ]
-        return sequence[step] if step < len(sequence) else []
-    if "退出 Plan Mode" in prompt:
-        return (
-            [("write_file", {"path": "plan-result.txt", "content": "planned\n"})]
-            if step == 0
-            else []
-        )
     if "未知工具" in prompt:
         return [("missing_tool", {})]
     if "取消并发读" in prompt:
@@ -154,10 +167,10 @@ def current_tool_step(messages: list[dict[str, Any]]) -> int:
     return count
 
 
-def final_text(prompt: str) -> str:
-    if "只读 Plan Mode" in prompt or "继续在只读 Plan Mode" in prompt:
+def final_text(prompt: str, mode: str) -> str:
+    if mode == "plan":
         return "调查完成。计划：根据搜索结果更新目标文件，然后运行验证。"
-    if "退出 Plan Mode" in prompt:
+    if prompt.strip() == "/do":
         return "计划已经执行完成。"
     return "工具结果已收到，已完成请求。"
 
@@ -168,6 +181,7 @@ def openai_sse(
     *,
     prompt: str,
     step: int,
+    mode: str,
 ) -> str:
     chunks: list[dict[str, object]] = []
     if final and not calls:
@@ -181,7 +195,7 @@ def openai_sse(
                     "choices": [
                         {
                             "index": 0,
-                            "delta": {"content": final_text(prompt)[:8]},
+                            "delta": {"content": final_text(prompt, mode)[:8]},
                             "finish_reason": None,
                         }
                     ],
@@ -194,7 +208,7 @@ def openai_sse(
                     "choices": [
                         {
                             "index": 0,
-                            "delta": {"content": final_text(prompt)[8:]},
+                            "delta": {"content": final_text(prompt, mode)[8:]},
                             "finish_reason": "stop",
                         }
                     ],
@@ -273,7 +287,11 @@ def openai_sse(
         "created": 1,
         "model": "mock",
         "choices": [],
-        "usage": {"prompt_tokens": 10 + step, "completion_tokens": 3},
+        "usage": {
+            "prompt_tokens": 10 + step,
+            "completion_tokens": 3,
+            "prompt_tokens_details": {"cached_tokens": 0 if step == 0 else 8},
+        },
     }
     chunks.append(usage)
     return (
@@ -288,6 +306,7 @@ def anthropic_sse(
     *,
     prompt: str,
     step: int,
+    mode: str,
 ) -> str:
     events: list[tuple[str, dict[str, object]]] = [
         (
@@ -302,7 +321,12 @@ def anthropic_sse(
                     "model": "mock",
                     "stop_reason": None,
                     "stop_sequence": None,
-                    "usage": {"input_tokens": 1, "output_tokens": 0},
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 0,
+                        "cache_creation_input_tokens": 12 if step == 0 else 0,
+                        "cache_read_input_tokens": 0 if step == 0 else 10,
+                    },
                 },
             },
         )
@@ -323,7 +347,7 @@ def anthropic_sse(
                     {
                         "type": "content_block_delta",
                         "index": 0,
-                        "delta": {"type": "text_delta", "text": final_text(prompt)},
+                        "delta": {"type": "text_delta", "text": final_text(prompt, mode)},
                     },
                 ),
                 ("content_block_stop", {"type": "content_block_stop", "index": 0}),
@@ -420,9 +444,23 @@ class Handler(BaseHTTPRequestHandler):
         messages = body.get("messages", [])
         prompt = prompt_from_messages(messages)
         step = current_tool_step(messages)
-        calls = select_calls(prompt, step)
-        final = step > 0 and not calls
         protocol = "openai" if self.path.endswith("/chat/completions") else "anthropic"
+        if protocol == "openai":
+            system_blocks = [
+                message.get("content", "")
+                for message in messages
+                if message.get("role") == "system"
+            ]
+        else:
+            system_blocks = [
+                block.get("text", "") for block in body.get("system", []) if isinstance(block, dict)
+            ]
+        reminder = next((text for text in system_blocks if "<system-reminder>" in text), "")
+        mode = "plan" if "Agent 模式：plan" in reminder else "normal"
+        calls = select_calls(prompt, step, mode)
+        final = step > 0 and not calls
+        stable_system = system_blocks[0] if system_blocks else ""
+        tools = body.get("tools", [])
         with self.log_path.open("a", encoding="utf-8") as handle:
             handle.write(
                 json.dumps(
@@ -437,9 +475,24 @@ class Handler(BaseHTTPRequestHandler):
                             tool.get("function", {}).get("name", "")
                             if protocol == "openai"
                             else tool.get("name", "")
-                            for tool in body.get("tools", [])
+                            for tool in tools
                         ],
-                        "messages": messages,
+                        "stable_system_sha256": hashlib.sha256(
+                            stable_system.encode("utf-8")
+                        ).hexdigest(),
+                        "system_block_count": len(system_blocks),
+                        "reminder_present": bool(reminder),
+                        "mode": mode,
+                        "system_cache_control": (
+                            body.get("system", [{}])[0].get("cache_control")
+                            if protocol == "anthropic" and body.get("system")
+                            else None
+                        ),
+                        "last_tool_cache_control": (
+                            tools[-1].get("cache_control")
+                            if protocol == "anthropic" and tools
+                            else None
+                        ),
                     },
                     ensure_ascii=False,
                 )
@@ -459,9 +512,9 @@ class Handler(BaseHTTPRequestHandler):
             )
         else:
             payload = (
-                openai_sse(calls, final, prompt=prompt, step=step)
+                openai_sse(calls, final, prompt=prompt, step=step, mode=mode)
                 if protocol == "openai"
-                else anthropic_sse(calls, final, prompt=prompt, step=step)
+                else anthropic_sse(calls, final, prompt=prompt, step=step, mode=mode)
             )
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")

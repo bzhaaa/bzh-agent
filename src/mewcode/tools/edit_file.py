@@ -22,7 +22,8 @@ class EditFileTool:
     policy = ToolExecutionPolicy.SERIAL_SIDE_EFFECT
     definition = ToolDefinition(
         "edit_file",
-        "先用 read_file 获取当前精确原文，再在项目内文本文件中执行唯一、小范围替换；匹配失败时依据错误调整。",
+        "先用 read_file 获取当前精确原文，再在项目内文本文件中执行唯一、小范围替换；"
+        "匹配失败时依据错误调整。",
         EditFileArguments.model_json_schema(),
     )
 

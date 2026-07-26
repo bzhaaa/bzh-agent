@@ -58,7 +58,8 @@ class ExecuteCommandTool:
     policy = ToolExecutionPolicy.SERIAL_SIDE_EFFECT
     definition = ToolDefinition(
         "execute_command",
-        "仅在专用读写改查工具无法完成测试、构建或命令任务时，在项目根目录执行 Shell 命令；不得替代专用工具，每次执行前都需确认。",
+        "仅在专用读写改查工具无法完成测试、构建或命令任务时，在项目根目录执行 Shell 命令；"
+        "不得替代专用工具，每次执行前都需确认。",
         ExecuteCommandArguments.model_json_schema(),
     )
 

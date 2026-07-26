@@ -1,5 +1,7 @@
 """CLI 入口测试。"""
 
+import importlib.util
+import sys
 from io import StringIO
 from pathlib import Path
 
@@ -8,7 +10,21 @@ from rich.console import Console
 
 from mewcode import cli
 from mewcode.config import ProviderProfile
+from mewcode.models import ProviderEvent, ProviderEventKind, TokenUsage
+from mewcode.prompting import PromptEnvelope, PromptPipeline
 from mewcode.tui import TranscriptEntry, TranscriptSnapshot
+
+_CACHE_SCRIPT_PATH = Path(__file__).parents[1] / "scripts" / "verify_prompt_cache.py"
+_CACHE_SCRIPT_SPEC = importlib.util.spec_from_file_location(
+    "mewcode_test_verify_prompt_cache", _CACHE_SCRIPT_PATH
+)
+assert _CACHE_SCRIPT_SPEC is not None and _CACHE_SCRIPT_SPEC.loader is not None
+_CACHE_SCRIPT = importlib.util.module_from_spec(_CACHE_SCRIPT_SPEC)
+sys.modules[_CACHE_SCRIPT_SPEC.name] = _CACHE_SCRIPT
+_CACHE_SCRIPT_SPEC.loader.exec_module(_CACHE_SCRIPT)
+build_cache_parser = _CACHE_SCRIPT.build_parser
+render_records = _CACHE_SCRIPT.render_records
+verify_profile = _CACHE_SCRIPT.verify_profile
 
 
 def write_config(path: Path) -> Path:
@@ -177,3 +193,47 @@ async def test_run_app_fixes_tool_root_to_starting_directory(
     monkeypatch.setattr(cli, "MewCodeApp", FakeApp)
     await cli.run_app(profile)
     assert captured_sessions[0].context.project_root == tmp_path
+    assert isinstance(captured_sessions[0].runner.prompt_pipeline, PromptPipeline)
+
+
+@pytest.mark.asyncio
+async def test_prompt_cache_verifier_is_bounded_and_preserves_unknown(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    profile = ProviderProfile.model_validate(
+        {
+            "name": "cache-test",
+            "protocol": "openai",
+            "model": "cache-model",
+            "base_url": "https://api.example.com/v1",
+            "api_key": "never-print-this-secret",
+        }
+    )
+
+    class FakeProvider:
+        def __init__(self) -> None:
+            self.requests: list[PromptEnvelope] = []
+
+        async def stream(self, request: PromptEnvelope):
+            self.requests.append(request)
+            yield ProviderEvent(
+                ProviderEventKind.TEXT_DELTA,
+                "完成",
+            )
+            yield ProviderEvent(
+                ProviderEventKind.TOKEN_USAGE,
+                usage=TokenUsage(20, 2, None, None),
+            )
+            yield ProviderEvent(ProviderEventKind.DONE)
+
+    provider = FakeProvider()
+    records = await verify_profile(profile, 2, provider=provider)  # type: ignore[arg-type]
+    assert len(provider.requests) == 2
+    assert len(records) == 2
+    assert provider.requests[0].prompt.stable_system == provider.requests[1].prompt.stable_system
+    render_records(profile, records)
+    output = capsys.readouterr().out
+    assert "cache_read=unknown" in output
+    assert "never-print-this-secret" not in output
+    with pytest.raises(SystemExit):
+        build_cache_parser().parse_args(["--requests", "5"])

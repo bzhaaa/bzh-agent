@@ -215,3 +215,35 @@ def test_prompt_options_update_is_atomic_and_validated(tmp_path: Path) -> None:
     with pytest.raises(PromptBuildError):
         session.set_prompt_options(PromptOptions(custom_instructions="x" * 20_000))
     assert session.prompt_options == valid
+
+
+@pytest.mark.asyncio
+async def test_new_user_submission_resets_full_reminder(tmp_path: Path) -> None:
+    provider = QueueProvider([text_round("首次"), text_round("再次")])
+    session = ChatSession(provider, context=ToolContext(tmp_path))
+    await collect(session, "第一个任务")
+    await collect(session, "第二个任务")
+    assert len(provider.envelopes) == 2
+    assert all(
+        "持续调查、执行并验证" in request.prompt.supplements[0] for request in provider.envelopes
+    )
+
+
+@pytest.mark.asyncio
+async def test_active_run_rejects_prompt_option_update(tmp_path: Path) -> None:
+    started = asyncio.Event()
+
+    class BlockingProvider:
+        async def stream(self, _request: PromptEnvelope) -> AsyncIterator[ProviderEvent]:
+            started.set()
+            await asyncio.Event().wait()
+            yield ProviderEvent(ProviderEventKind.DONE)
+
+    session = ChatSession(BlockingProvider(), context=ToolContext(tmp_path))
+    task = asyncio.create_task(collect(session, "任务"))
+    await started.wait()
+    with pytest.raises(RuntimeError, match="不能更新"):
+        session.set_prompt_options(PromptOptions(custom_instructions="新值"))
+    session.cancel_current()
+    events = await task
+    assert events[-1].stop_reason == AgentStopReason.CANCELLED

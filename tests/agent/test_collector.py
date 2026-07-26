@@ -121,6 +121,13 @@ async def test_missing_usage_becomes_unknown() -> None:
             ProviderEvent(ProviderEventKind.TOKEN_USAGE, usage=TokenUsage(-1, 2)),
             ProviderEvent(ProviderEventKind.DONE),
         ],
+        [
+            ProviderEvent(
+                ProviderEventKind.TOKEN_USAGE,
+                usage=TokenUsage(1, 2, cache_read_input_tokens=-1),
+            ),
+            ProviderEvent(ProviderEventKind.DONE),
+        ],
     ],
 )
 async def test_invalid_streams_are_rejected(events: list[ProviderEvent]) -> None:

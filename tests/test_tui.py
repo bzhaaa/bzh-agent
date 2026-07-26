@@ -112,12 +112,12 @@ async def test_plan_do_mode_and_usage_status() -> None:
         [
             [
                 ProviderEvent(ProviderEventKind.TEXT_DELTA, "计划"),
-                ProviderEvent(ProviderEventKind.TOKEN_USAGE, usage=TokenUsage(5, 2)),
+                ProviderEvent(ProviderEventKind.TOKEN_USAGE, usage=TokenUsage(5, 2, 3, 1)),
                 ProviderEvent(ProviderEventKind.DONE),
             ],
             [
                 ProviderEvent(ProviderEventKind.TEXT_DELTA, "执行"),
-                ProviderEvent(ProviderEventKind.TOKEN_USAGE, usage=TokenUsage(3, 1)),
+                ProviderEvent(ProviderEventKind.TOKEN_USAGE, usage=TokenUsage(3, 1, 0, 2)),
                 ProviderEvent(ProviderEventKind.DONE),
             ],
         ]
@@ -137,6 +137,7 @@ async def test_plan_do_mode_and_usage_status() -> None:
         assert app.mode == AgentMode.NORMAL
         assert "Normal" in status
         assert "Token 4" in status
+        assert "cache" not in status.lower()
         assert [entry.role for entry in app.transcript] == [
             "user",
             "assistant",
